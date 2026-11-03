@@ -60,6 +60,8 @@ impl TestHome {
     }
 
     fn fake_curl(&self) {
+        // Health alone is intentionally insufficient in the authenticated fork.
+        self.private_token();
         self.script(
             "curl",
             "#!/bin/sh\n\
@@ -378,7 +380,7 @@ fn linux_ssh_setup_reports_linux_start_command_without_connecting() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     let error = String::from_utf8(out.stderr).unwrap();
-    assert!(error.contains("cannot load local token"));
+    assert!(error.contains("authenticated /clipboard/type check failed"));
     assert!(!error.contains("brew"));
     assert!(!home.0.join(".ssh").exists());
 }

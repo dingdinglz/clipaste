@@ -301,6 +301,11 @@ mod tests {
     }
 
     #[test]
+    fn reported_version_matches_the_package() {
+        assert_eq!(crate::common::VERSION, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
     fn host_only() {
         let (h, p) = parse_ssh_setup_args(&s(&["user@host"])).unwrap();
         assert_eq!(h, "user@host");
