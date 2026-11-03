@@ -151,8 +151,16 @@ with tempfile.TemporaryDirectory(prefix="clipaste-smoke-") as temp:
         assert (cache.stat().st_mode & 0o777) == 0o700
         assert all(p.stat().st_mode & 0o777 == 0o600 for p in cache.glob("*.png"))
         original_path.unlink()
+        wait_for(lambda: get("/clipboard/image")[0] == 204,
+                 "deleted image stayed published")
+        assert not original_path.exists(), "unchanged selection must not defeat cache expiry"
+        # A changed selection explicitly stages the image again; identical-byte
+        # polling alone must not recreate a file removed by the TTL worker.
+        copy(second)
+        wait_for(lambda: get("/clipboard/image") == (200, second), "selection change not observed")
+        copy(first)
         wait_for(lambda: original_path.exists() and get("/clipboard/image") == (200, first),
-                 "unchanged clipboard did not restore deleted cache")
+                 "new selection did not restore its cache")
 
         copy(b"not actually a PNG")
         wait_for(lambda: get("/clipboard/image")[0] == 204, "corrupt image left stale PNG")

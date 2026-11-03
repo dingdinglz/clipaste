@@ -287,10 +287,7 @@ fn normalize(
         }
     };
 
-    let file_path = match common::save_png_to_temp(&png_data) {
-        Some(p) => p,
-        None => return None,
-    };
+    let file_path = common::save_png_to_temp(&png_data)?;
     if unsafe { GetClipboardSequenceNumber() } != expected_seq {
         return None;
     }
