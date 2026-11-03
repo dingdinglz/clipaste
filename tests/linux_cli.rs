@@ -50,13 +50,26 @@ impl TestHome {
             .success());
     }
 
+    fn private_token(&self) {
+        let dir = self.0.join(".config/clipaste");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("token");
+        fs::write(&path, "a".repeat(64)).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
     fn fake_curl(&self) {
         self.script(
             "curl",
             "#!/bin/sh\n\
              printf '%s\\n' \"$@\" >> \"$HOME/curl-args\"\n\
+             while IFS= read -r line; do :; done\n\
              if [ \"$CLIPASTE_TEST_CURL_FAIL\" = 1 ]; then exit 22; fi\n\
-             printf '%s' '{\"status\":\"ok\",\"version\":\"test\"}'\n",
+             case \"$*\" in\n\
+             */clipboard/type*) printf '%s' '{\"type\":\"empty\"}' ;;\n\
+             *) printf '%s' '{\"status\":\"ok\",\"version\":\"test\",\"auth\":\"bearer\"}' ;;\n\
+             esac\n",
         );
     }
 }
@@ -172,6 +185,10 @@ fn configured_consumer_checks_its_bridge_without_real_network_access() {
         "#!/bin/sh\nCLIPASTE_URL=\"http://127.0.0.1:18444\"\nexit 0\n",
     );
     home.fake_curl();
+    home.private_token();
+    for name in ["xclip", "wl-paste"] {
+        home.script(&format!(".local/bin/{name}"), "#!/bin/sh\nexit 0\n");
+    }
     let path = std::env::join_paths([&bin, &home.0]).unwrap();
     for (failure, code, bridge_status) in [("0", 0, "ok"), ("1", 1, "fail")] {
         let out = home
@@ -195,8 +212,12 @@ fn configured_consumer_checks_its_bridge_without_real_network_access() {
 fn valid_wsl_setup_still_installs_consumer_helpers() {
     let home = TestHome::new();
     home.fake_curl();
+    home.private_token();
+    let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", home.0.display());
     let out = home
         .command()
+        .env("PATH", path)
+        .env("SHELL", "/bin/bash")
         .env("WSL_DISTRO_NAME", "Ubuntu")
         .args(["wsl-setup", "--host", "127.0.0.1"])
         .output()
@@ -357,7 +378,7 @@ fn linux_ssh_setup_reports_linux_start_command_without_connecting() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     let error = String::from_utf8(out.stderr).unwrap();
-    assert!(error.contains("Linux graphical desktop session"));
+    assert!(error.contains("cannot load local token"));
     assert!(!error.contains("brew"));
     assert!(!home.0.join(".ssh").exists());
 }

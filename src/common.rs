@@ -2,19 +2,22 @@
 use image::codecs::png::PngEncoder;
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
 use image::ImageEncoder;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 use image::ImageFormat;
 use sha2::{Digest, Sha256};
 use std::fs;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::io::Cursor;
+#[cfg(any(target_os = "macos", test))]
+use std::io::Read;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-pub const VERSION: &str = "2.6.0";
+pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+static CACHE_IO: Mutex<()> = Mutex::new(());
+
+pub const VERSION: &str = "2.6.1-dingdinglz.1";
 pub const DEFAULT_PORT: u16 = 18340;
 
 pub fn supports_clipboard_host(os: &str) -> bool {
@@ -27,7 +30,7 @@ pub fn unsupported_host_message(os: &str) -> String {
          Linux is supported as an SSH consumer: run `clipaste ssh-setup user@host` on \
          the clipboard host, then use `clipaste-paste` on the remote.\n\
          In WSL2, run `clipaste wsl-setup` with clipaste.exe running on Windows.\n\
-         See https://github.com/hqhq1025/clipaste#supported-platforms"
+         See https://github.com/dingdinglz/clipaste#install-from-source"
     )
 }
 
@@ -35,44 +38,47 @@ pub fn unsupported_host_message(os: &str) -> String {
 pub type LatestImage = Arc<Mutex<Option<PathBuf>>>;
 
 pub fn temp_dir() -> PathBuf {
-    cache_root().join("clipaste")
+    // All writes validate configuration first: this fallback is diagnostic only.
+    cache_root()
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("clipaste-unconfigured-{}", std::process::id()))
+        })
+        .join("clipaste")
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn cache_root() -> PathBuf {
+fn cache_root() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
         let p = PathBuf::from(xdg);
         if !p.as_os_str().is_empty() {
-            return p;
+            return p.is_absolute().then_some(p);
         }
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = PathBuf::from(home);
-        if !p.as_os_str().is_empty() {
-            return p.join(".cache");
-        }
-    }
-    std::env::temp_dir()
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    home.is_absolute().then(|| home.join(".cache"))
 }
 
 #[cfg(target_os = "windows")]
-fn cache_root() -> PathBuf {
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        let p = PathBuf::from(local);
-        if !p.as_os_str().is_empty() {
-            return p;
-        }
-    }
-    std::env::temp_dir()
+fn cache_root() -> Option<PathBuf> {
+    let local = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
+    local.is_absolute().then_some(local)
 }
 
-pub fn ensure_temp_dir() {
-    if let Err(e) = ensure_cache_dir(&temp_dir()) {
-        log(&format!("failed to prepare PNG cache: {e}"));
-    }
+pub fn ensure_temp_dir() -> io::Result<()> {
+    let root = cache_root().ok_or_else(|| {
+        io::Error::other(
+            "PNG cache requires an absolute HOME/XDG_CACHE_HOME (LOCALAPPDATA on Windows)",
+        )
+    })?;
+    ensure_cache_dir(&root.join("clipaste"))
 }
 
 fn ensure_cache_dir(dir: &Path) -> io::Result<()> {
+    if let Ok(meta) = fs::symlink_metadata(dir) {
+        if !meta.file_type().is_dir() {
+            return Err(io::Error::other("PNG cache must be a real directory"));
+        }
+    }
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -86,7 +92,12 @@ fn ensure_cache_dir(dir: &Path) -> io::Result<()> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if fs::symlink_metadata(dir)?.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::other(
+                "PNG cache is not owned by the current user",
+            ));
+        }
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
@@ -104,7 +115,19 @@ fn ensure_cache_dir(dir: &Path) -> io::Result<()> {
 /// attempt for minutes.
 pub fn http_get(url: &str) -> Option<String> {
     let out = std::process::Command::new("curl")
-        .args(["-sf", "--connect-timeout", "2", "-m", "5", url])
+        .args([
+            "-q",
+            "-sf",
+            "--noproxy",
+            "*",
+            "--connect-timeout",
+            "2",
+            "-m",
+            "5",
+            "--max-filesize",
+            "65536",
+            url,
+        ])
         .output()
         .ok()?;
     if out.status.success() {
@@ -154,13 +177,13 @@ fn png_cache_name(bytes: &[u8]) -> String {
 
 /// Save PNG bytes at a stable, content-addressed path, reusing identical bytes.
 ///
-/// Published paths (including legacy timestamp paths) are retained until the
-/// user explicitly deletes them: clipboard histories can reference them long
-/// after the daemon exits. Disk usage therefore grows with unique images.
+/// Explicit recopies refresh retention for identical valid bytes. Cache expiry
+/// runs while the daemon is alive and at its next startup.
 /// A conflicting/corrupt cache entry is never replaced;
 /// saving fails and logs an error so its owner can inspect or explicitly delete it.
 pub fn save_png_to_temp(png_data: &[u8]) -> Option<PathBuf> {
-    match save_png_in_dir(&temp_dir(), png_data) {
+    let result = ensure_temp_dir().and_then(|()| save_png_in_dir(&temp_dir(), png_data));
+    match result {
         Ok(path) => Some(path),
         Err(e) => {
             log(&format!("failed to save cached PNG: {e}"));
@@ -173,7 +196,7 @@ fn verify_cached_png(path: &Path, png_data: &[u8]) -> io::Result<()> {
     if !fs::symlink_metadata(path)?.file_type().is_file() {
         return Err(io::Error::other("PNG cache entry must be a regular file"));
     }
-    let file = fs::File::open(path)?;
+    let file = open_regular_file(path, true)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -186,6 +209,7 @@ fn verify_cached_png(path: &Path, png_data: &[u8]) -> io::Result<()> {
         use std::io::BufRead;
         let chunk = reader.fill_buf()?;
         if chunk.is_empty() && remaining.is_empty() {
+            reader.get_ref().set_modified(SystemTime::now())?;
             return Ok(());
         }
         if chunk.is_empty() || !remaining.starts_with(chunk) {
@@ -272,6 +296,13 @@ fn publish_staged_png(staged: &Path, path: &Path, png_data: &[u8]) -> io::Result
 }
 
 fn save_png_in_dir(dir: &Path, png_data: &[u8]) -> io::Result<PathBuf> {
+    if !validate_png(png_data) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid or oversized PNG",
+        ));
+    }
+    let _io = CACHE_IO.lock().unwrap();
     ensure_cache_dir(dir)?;
     let path = dir.join(png_cache_name(png_data));
     match verify_cached_png(&path, png_data) {
@@ -315,19 +346,208 @@ fn save_png_in_dir(dir: &Path, png_data: &[u8]) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Kept for existing callers. Published PNGs have no automatic expiry because
-/// external clipboard histories retain their paths. Remove them explicitly to
-/// reclaim disk space; interrupted staging files may also be removed manually.
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
-pub fn clean_old_temp_files() {}
+fn parse_cache_ttl(value: Option<&str>) -> Result<Option<Duration>, String> {
+    let value = value.unwrap_or("3600");
+    if value.is_empty() || !value.bytes().all(|c| c.is_ascii_digit()) {
+        return Err(
+            "CLIPASTE_CACHE_TTL_SECONDS must be a nonnegative integer (0 disables expiry)".into(),
+        );
+    }
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| "CLIPASTE_CACHE_TTL_SECONDS is too large".to_string())?;
+    Ok((seconds != 0).then(|| Duration::from_secs(seconds)))
+}
 
-/// Convert TIFF bytes to PNG bytes
-#[cfg(target_os = "macos")]
-pub fn tiff_to_png(tiff_data: &[u8]) -> Option<Vec<u8>> {
-    let img = image::load_from_memory_with_format(tiff_data, ImageFormat::Tiff).ok()?;
+pub fn cache_ttl() -> Result<Option<Duration>, String> {
+    match std::env::var("CLIPASTE_CACHE_TTL_SECONDS") {
+        Ok(value) => parse_cache_ttl(Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse_cache_ttl(None),
+        Err(_) => Err("CLIPASTE_CACHE_TTL_SECONDS must be valid UTF-8".into()),
+    }
+}
+
+fn image_is_fresh_at(path: &Path, ttl: Option<Duration>, now: SystemTime) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_file() || meta.len() > MAX_IMAGE_BYTES as u64 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if meta.uid() != unsafe { libc::geteuid() } || meta.permissions().mode() & 0o077 != 0 {
+            return false;
+        }
+    }
+    let Some(ttl) = ttl else {
+        return true;
+    };
+    meta.modified()
+        .is_ok_and(|modified| now.duration_since(modified).unwrap_or_default() < ttl)
+}
+
+pub fn cached_image_is_fresh(path: &Path) -> bool {
+    cache_ttl().is_ok_and(|ttl| image_is_fresh_at(path, ttl, SystemTime::now()))
+}
+
+fn managed_cache_name(name: &str) -> bool {
+    fn digits(value: &str) -> bool {
+        !value.is_empty() && value.bytes().all(|c| c.is_ascii_digit())
+    }
+    if let Some(hash) = name
+        .strip_prefix("shot-sha256-")
+        .and_then(|s| s.strip_suffix(".png"))
+    {
+        return hash.len() == 64 && hash.bytes().all(|c| c.is_ascii_hexdigit());
+    }
+    if let Some(stamp) = name
+        .strip_prefix("shot-")
+        .and_then(|s| s.strip_suffix(".png"))
+    {
+        // Legacy v2.3 base36 milliseconds and numeric timestamp forms. Limit
+        // base36 to plausible timestamps, not arbitrary shot-*.png names.
+        return (stamp.split('-').all(digits) && stamp.split('-').count() <= 2)
+            || (stamp
+                .bytes()
+                .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
+                && u64::from_str_radix(stamp, 36)
+                    .is_ok_and(|ms| (1_500_000_000_000..=4_102_444_800_000).contains(&ms)));
+    }
+    if let Some(stamp) = name
+        .strip_prefix("screenshot-")
+        .and_then(|s| s.strip_suffix(".png"))
+    {
+        return digits(stamp);
+    }
+    if let Some(stage) = name.strip_prefix(".png-stage-") {
+        return stage.split('-').count() == 2 && stage.split('-').all(digits);
+    }
+    false
+}
+
+fn cleanup_cache_at(
+    dir: &Path,
+    latest: &LatestImage,
+    ttl: Option<Duration>,
+    now: SystemTime,
+) -> io::Result<()> {
+    let _io = CACHE_IO.lock().unwrap();
+    ensure_cache_dir(dir)?;
+    let mut staged = latest.lock().unwrap();
+    if staged
+        .as_ref()
+        .is_some_and(|p| !image_is_fresh_at(p, ttl, now))
+    {
+        *staged = None;
+    }
+    let Some(ttl) = ttl else {
+        return Ok(());
+    };
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_name().to_str().is_some_and(managed_cache_name) {
+            continue;
+        }
+        let path = entry.path();
+        // symlink_metadata, never metadata: don't delete or follow a symlink.
+        if fs::symlink_metadata(&path)?.file_type().is_file()
+            && fs::symlink_metadata(&path)?
+                .modified()
+                .is_ok_and(|modified| now.duration_since(modified).unwrap_or_default() >= ttl)
+        {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate before the server starts. Expiry requires a running daemon; the
+/// startup pass also removes leftovers from times when it was stopped.
+pub fn start_cache_cleanup(latest: LatestImage) -> Result<(), String> {
+    let ttl = cache_ttl()?;
+    ensure_temp_dir().map_err(|e| format!("Cannot initialize PNG cache: {e}"))?;
+    let dir = temp_dir();
+    cleanup_cache_at(&dir, &latest, ttl, SystemTime::now()).map_err(|e| e.to_string())?;
+    std::thread::Builder::new()
+        .name("cache-cleanup".into())
+        .spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(60));
+            if let Err(e) = cleanup_cache_at(&dir, &latest, ttl, SystemTime::now()) {
+                log(&format!("PNG cache cleanup failed: {e}"));
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn open_regular_file(path: &Path, writable: bool) -> io::Result<fs::File> {
+    if !fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(io::Error::other(
+            "Image must be a regular file, not a symlink",
+        ));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(writable);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("Image must be a regular file"));
+    }
+    Ok(file)
+}
+
+fn decode_bounded(bytes: &[u8], format: ImageFormat) -> Option<image::DynamicImage> {
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16384);
+    limits.max_image_height = Some(16384);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let img = reader.decode().ok()?;
+    // Conversion to RGBA must also fit the allocation budget, independently of
+    // the source decoder's pixel layout.
+    if u64::from(img.width()) * u64::from(img.height()) * 4 > 128 * 1024 * 1024 {
+        return None;
+    }
+    Some(img)
+}
+
+pub fn validate_png(bytes: &[u8]) -> bool {
+    decode_bounded(bytes, ImageFormat::Png).is_some()
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+fn encode_png(img: image::DynamicImage) -> Option<Vec<u8>> {
     let rgba = img.to_rgba8();
-    let mut buf = Vec::new();
-    PngEncoder::new(Cursor::new(&mut buf))
+    // Bound even encoder output, not just the resulting allocation afterward.
+    struct Bounded(Vec<u8>);
+    impl Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > MAX_IMAGE_BYTES.saturating_sub(self.0.len()) {
+                return Err(io::Error::other("PNG output exceeds 64 MiB"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut buf = Bounded(Vec::new());
+    PngEncoder::new(&mut buf)
         .write_image(
             rgba.as_raw(),
             rgba.width(),
@@ -335,39 +555,37 @@ pub fn tiff_to_png(tiff_data: &[u8]) -> Option<Vec<u8>> {
             image::ExtendedColorType::Rgba8,
         )
         .ok()?;
-    Some(buf)
+    Some(buf.0)
 }
 
-/// Read an image file from disk and return PNG bytes.
-///
-/// Used when the clipboard holds a *file URL* pointing to an image (e.g. a macOS
-/// screenshot saved to disk, then copied in Finder) — see issue #5. Only formats
-/// the bundled `image` decoder supports are handled (png passthrough, tiff, bmp);
-/// macOS screenshots are PNG by default, which is the common case. Returns None
-/// for unsupported formats so the caller can skip cleanly rather than serve
-/// mislabeled bytes.
 #[cfg(target_os = "macos")]
-pub fn image_file_to_png(path: &std::path::Path) -> Option<Vec<u8>> {
-    let ext = path.extension()?.to_str()?.to_lowercase();
-    let bytes = fs::read(path).ok()?;
-    match ext.as_str() {
-        "png" => Some(bytes), // already PNG — pass through unchanged
-        "tif" | "tiff" => tiff_to_png(&bytes),
-        "bmp" => {
-            let img = image::load_from_memory_with_format(&bytes, ImageFormat::Bmp).ok()?;
-            let rgba = img.to_rgba8();
-            let mut buf = Vec::new();
-            PngEncoder::new(Cursor::new(&mut buf))
-                .write_image(
-                    rgba.as_raw(),
-                    rgba.width(),
-                    rgba.height(),
-                    image::ExtendedColorType::Rgba8,
-                )
-                .ok()?;
-            Some(buf)
-        }
-        _ => None,
+pub fn tiff_to_png(tiff_data: &[u8]) -> Option<Vec<u8>> {
+    encode_png(decode_bounded(tiff_data, ImageFormat::Tiff)?)
+}
+
+/// Extension selects a decoder, never a trust decision. Reject links and bound
+/// both the source read and the decoder before publishing any clipboard file.
+#[cfg(any(target_os = "macos", test))]
+pub fn image_file_to_png(path: &Path) -> Option<Vec<u8>> {
+    let format = match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" => ImageFormat::Png,
+        "tif" | "tiff" => ImageFormat::Tiff,
+        "bmp" => ImageFormat::Bmp,
+        _ => return None,
+    };
+    let file = open_regular_file(path, false).ok()?;
+    if file.metadata().ok()?.len() > MAX_IMAGE_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_IMAGE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let image = decode_bounded(&bytes, format)?;
+    if format == ImageFormat::Png {
+        Some(bytes)
+    } else {
+        encode_png(image)
     }
 }
 
@@ -377,7 +595,7 @@ pub fn dib_to_png(dib_data: &[u8]) -> Option<Vec<u8>> {
     // CF_DIB is a BITMAPINFOHEADER followed by pixel data
     // The image crate's BMP decoder expects a full BMP file header,
     // so we prepend a minimal BITMAPFILEHEADER
-    if dib_data.len() < 40 {
+    if dib_data.len() < 40 || dib_data.len() > MAX_IMAGE_BYTES {
         return None;
     }
 
@@ -408,18 +626,7 @@ pub fn dib_to_png(dib_data: &[u8]) -> Option<Vec<u8>> {
     bmp.extend_from_slice(&(pixel_offset as u32).to_le_bytes());
     bmp.extend_from_slice(dib_data);
 
-    let img = image::load_from_memory_with_format(&bmp, ImageFormat::Bmp).ok()?;
-    let rgba = img.to_rgba8();
-    let mut buf = Vec::new();
-    PngEncoder::new(Cursor::new(&mut buf))
-        .write_image(
-            rgba.as_raw(),
-            rgba.width(),
-            rgba.height(),
-            image::ExtendedColorType::Rgba8,
-        )
-        .ok()?;
-    Some(buf)
+    encode_png(decode_bounded(&bmp, ImageFormat::Bmp)?)
 }
 
 pub fn print_help() {
@@ -432,7 +639,7 @@ USAGE
   clipaste ssh-setup user@host   Configure remote server for image paste via SSH
                                  (add -p PORT for a custom SSH port)
   clipaste wsl-setup             Configure WSL2 for image paste from Windows host
-                                 (add --host IP to skip host auto-detection)
+                                 (--host IP; first setup: --token-file PATH)
   clipaste --version             Print version
   clipaste --help                Show this help
 
@@ -447,22 +654,25 @@ FOR CODING AGENTS
   Use it with Codex CLI (which bypasses the xclip shim) or any macOS remote.
 
 WHAT IT DOES
-  Local:  Watches the clipboard. When a screenshot is detected, saves it as
-          a cached PNG. macOS/Windows also register the file path for pasting,
-          unless CLIPASTE_SERVER_ONLY=1 is set: then the clipboard stays as
-          copied (GUI apps paste the image) and the PNG is only served over
-          HTTP to SSH/WSL2 consumers.
+  Local:  Watches the clipboard and caches qualifying images privately.
+          The clipboard is left unchanged by default. Explicitly set
+          CLIPASTE_SERVER_ONLY=0 for local file-path normalization.
+          Images expire after one hour; cleanup runs at startup and every
+          minute while running. CLIPASTE_CACHE_TTL_SECONDS=0 opts into
+          indefinite retention. Deletion is not secure erasure.
           Linux reads image/png without modifying the clipboard.
 
-  SSH:    Runs an HTTP server on port {DEFAULT_PORT}. Use 'ssh-setup' to
-          configure SSH RemoteForward + xclip shim on a remote server.
+  SSH:    Runs a loopback HTTP server on port {DEFAULT_PORT}. Clipboard
+          endpoints require a private bearer token. Use 'ssh-setup' to
+          configure a trusted SSH remote and transfer credentials securely.
           Claude Code (Linux remote) pastes natively with Ctrl+V; Codex CLI
           and macOS remotes use the `clipaste-paste` helper.
 
   WSL2:   Run 'wsl-setup' inside WSL2 to install xclip shim that fetches
           images from clipaste.exe on the Windows host. No SSH needed.
-          The Windows host address is probed automatically (mirrored and NAT
-          networking modes both work); override it with --host IP if needed.
+          Import a private Windows token using --token-file PATH on first
+          setup. --host accepts a literal IP only. Prefer mirrored networking;
+          NAT cannot directly reach the Windows loopback listener.
 
 COMPATIBILITY
   Host:    macOS, Windows, Linux desktop (Wayland data-control or X11/XWayland)
@@ -478,7 +688,7 @@ COMPATIBILITY
            No local text-path injection; SSH consumers use the existing helpers.
 
 MORE INFO
-  https://github.com/hqhq1025/clipaste"
+  https://github.com/dingdinglz/clipaste"
     );
 }
 
@@ -614,7 +824,7 @@ mod cache_tests {
             .unwrap();
         assert!(status.success());
         assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);
-        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), old);
+        assert!(fs::metadata(&path).unwrap().modified().unwrap() > old);
         assert_eq!(fs::read(path).unwrap(), bytes);
     }
 
@@ -677,28 +887,172 @@ mod cache_tests {
         assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 4);
     }
 
+    fn set_mtime(path: &Path, time: SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
     #[test]
-    fn cleanup_retains_published_and_legacy_paths() {
-        let dir = TestDir::new();
-        let current = save_png_in_dir(&dir.0, &png(1)).unwrap();
-        let legacy = dir.0.join("shot-old-timestamp.png");
-        fs::write(&legacy, png(2)).unwrap();
-        for path in [&current, &legacy] {
-            fs::File::options()
-                .write(true)
-                .open(path)
-                .unwrap()
-                .set_times(
-                    fs::FileTimes::new()
-                        .set_modified(SystemTime::UNIX_EPOCH)
-                        .set_accessed(SystemTime::UNIX_EPOCH),
-                )
-                .unwrap();
+    fn ttl_parser_defaults_and_explicit_opt_out_are_strict() {
+        assert_eq!(
+            parse_cache_ttl(None).unwrap(),
+            Some(Duration::from_secs(3600))
+        );
+        assert_eq!(parse_cache_ttl(Some("0")).unwrap(), None);
+        assert_eq!(
+            parse_cache_ttl(Some("120")).unwrap(),
+            Some(Duration::from_secs(120))
+        );
+        for invalid in [
+            "",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "1.0",
+            "forever",
+            "18446744073709551616",
+        ] {
+            assert!(parse_cache_ttl(Some(invalid)).is_err(), "{invalid}");
         }
-        // This compatibility hook is intentionally a no-op and reads no HOME.
-        clean_old_temp_files();
-        assert_eq!(fs::read(current).unwrap(), png(1));
-        assert_eq!(fs::read(legacy).unwrap(), png(2));
+    }
+
+    #[test]
+    fn cleanup_expires_only_managed_regular_files_and_clears_staged_path() {
+        let dir = TestDir::new();
+        let ttl = Some(Duration::from_secs(3600));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10000);
+        let current = save_png_in_dir(&dir.0, &png(1)).unwrap();
+        set_mtime(&current, now - Duration::from_secs(3599));
+        let expired = save_png_in_dir(&dir.0, &png(2)).unwrap();
+        set_mtime(&expired, now - Duration::from_secs(3600));
+        let latest = LatestImage::new(Mutex::new(Some(current.clone())));
+        let legacy_names = [
+            "shot-1700000000000.png",
+            "shot-1700000000-123.png",
+            "shot-loyw3v28.png",
+            "screenshot-1700000000000.png",
+            ".png-stage-123-4",
+        ];
+        for name in legacy_names {
+            let path = dir.0.join(name);
+            fs::write(&path, b"legacy").unwrap();
+            set_mtime(&path, SystemTime::UNIX_EPOCH);
+        }
+        let unrelated = dir.0.join("shot-old-timestamp.png");
+        fs::write(&unrelated, b"not ours").unwrap();
+        set_mtime(&unrelated, SystemTime::UNIX_EPOCH);
+        let token = dir.0.join("token");
+        fs::write(&token, b"not ours either").unwrap();
+        set_mtime(&token, SystemTime::UNIX_EPOCH);
+        let directory = dir.0.join("shot-123.png");
+        fs::create_dir(&directory).unwrap();
+        cleanup_cache_at(&dir.0, &latest, ttl, now).unwrap();
+        assert_eq!(*latest.lock().unwrap(), Some(current.clone()));
+        assert!(current.exists());
+        assert!(!expired.exists());
+        for name in legacy_names {
+            assert!(!dir.0.join(name).exists(), "{name}");
+        }
+        assert!(unrelated.exists());
+        assert!(token.exists());
+        assert!(directory.is_dir());
+        cleanup_cache_at(&dir.0, &latest, ttl, now + Duration::from_secs(1)).unwrap();
+        assert!(latest.lock().unwrap().is_none());
+        assert!(!current.exists());
+    }
+
+    #[test]
+    fn ttl_zero_keeps_old_files_and_explicit_recopy_refreshes_timestamp() {
+        let dir = TestDir::new();
+        let bytes = png(1);
+        let path = save_png_in_dir(&dir.0, &bytes).unwrap();
+        set_mtime(&path, SystemTime::UNIX_EPOCH);
+        let latest = LatestImage::new(Mutex::new(Some(path.clone())));
+        cleanup_cache_at(&dir.0, &latest, None, SystemTime::now()).unwrap();
+        assert!(path.exists());
+        assert_eq!(*latest.lock().unwrap(), Some(path.clone()));
+        assert_eq!(save_png_in_dir(&dir.0, &bytes).unwrap(), path);
+        assert!(fs::metadata(&path).unwrap().modified().unwrap() > SystemTime::UNIX_EPOCH);
+        assert!(image_is_fresh_at(
+            &path,
+            Some(Duration::from_secs(3600)),
+            SystemTime::now()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_and_freshness_never_follow_symlinks_or_publish_public_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = TestDir::new();
+        let outside = TestDir::new();
+        let target = outside.0.join("target");
+        fs::write(&target, png(3)).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        set_mtime(&target, SystemTime::UNIX_EPOCH);
+        let link = dir.0.join("shot-123.png");
+        symlink(&target, &link).unwrap();
+        let latest = LatestImage::new(Mutex::new(Some(link.clone())));
+        assert!(!image_is_fresh_at(&link, None, SystemTime::now()));
+        cleanup_cache_at(
+            &dir.0,
+            &latest,
+            Some(Duration::from_secs(1)),
+            SystemTime::now(),
+        )
+        .unwrap();
+        assert!(latest.lock().unwrap().is_none());
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+        assert!(target.exists());
+        assert!(!image_is_fresh_at(&target, None, SystemTime::now()));
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(image_is_fresh_at(&target, None, SystemTime::now()));
+    }
+
+    #[test]
+    fn image_input_requires_valid_png_and_bounded_source_and_dimensions() {
+        let dir = TestDir::new();
+        let path = dir.0.join("input.png");
+        fs::write(&path, b"not actually PNG").unwrap();
+        assert!(image_file_to_png(&path).is_none());
+        assert!(save_png_in_dir(&dir.0, b"not PNG").is_err());
+        let bytes = png(1);
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(image_file_to_png(&path), Some(bytes.clone()));
+        fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+        assert!(image_file_to_png(&path).is_none());
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_IMAGE_BYTES as u64 + 1)
+            .unwrap();
+        assert!(image_file_to_png(&path).is_none());
+        let mut oversized_dimensions = Vec::new();
+        PngEncoder::new(&mut oversized_dimensions)
+            .write_image(
+                &vec![0; 16385 * 4],
+                16385,
+                1,
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        assert!(!validate_png(&oversized_dimensions));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_png_symlink_is_rejected() {
+        let dir = TestDir::new();
+        let original = dir.0.join("original.png");
+        let link = dir.0.join("link.png");
+        fs::write(&original, png(1)).unwrap();
+        std::os::unix::fs::symlink(&original, &link).unwrap();
+        assert!(image_file_to_png(&link).is_none());
+        assert!(image_file_to_png(&original).is_some());
     }
 
     #[cfg(unix)]

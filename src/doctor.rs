@@ -11,7 +11,7 @@
 //! the binary happens to be installed. A misleading green is worse than a red
 //! for an agent, which will otherwise report success to the user and stop.
 
-use crate::common;
+use crate::{common, security};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,13 +51,28 @@ pub struct Check {
 
 impl Check {
     fn ok(name: &'static str, detail: impl Into<String>) -> Self {
-        Check { name, status: Status::Ok, detail: detail.into(), fix: None }
+        Check {
+            name,
+            status: Status::Ok,
+            detail: detail.into(),
+            fix: None,
+        }
     }
     fn warn(name: &'static str, detail: impl Into<String>) -> Self {
-        Check { name, status: Status::Warn, detail: detail.into(), fix: None }
+        Check {
+            name,
+            status: Status::Warn,
+            detail: detail.into(),
+            fix: None,
+        }
     }
     fn fail(name: &'static str, detail: impl Into<String>) -> Self {
-        Check { name, status: Status::Fail, detail: detail.into(), fix: None }
+        Check {
+            name,
+            status: Status::Fail,
+            detail: detail.into(),
+            fix: None,
+        }
     }
     fn with_fix(mut self, fix: impl Into<String>) -> Self {
         self.fix = Some(fix.into());
@@ -118,7 +133,13 @@ fn graphical_session() -> bool {
     }
 }
 
-fn classify_role(os: &str, wsl: bool, ssh: bool, configured_consumer: bool, graphical: bool) -> Role {
+fn classify_role(
+    os: &str,
+    wsl: bool,
+    ssh: bool,
+    configured_consumer: bool,
+    graphical: bool,
+) -> Role {
     if os == "linux" && wsl {
         return Role::Wsl2;
     }
@@ -176,7 +197,7 @@ pub fn installed_helper_url(helper: &Path) -> Option<String> {
 fn parse_helper_url(content: &str) -> Option<String> {
     content.lines().find_map(|line| {
         let rest = line.trim().strip_prefix("CLIPASTE_URL=")?;
-        let url = rest.trim().trim_matches('"');
+        let url = rest.trim().trim_matches(&['"', '\''][..]);
         if url.is_empty() || url.contains("__CLIPASTE_URL__") {
             None
         } else {
@@ -186,7 +207,8 @@ fn parse_helper_url(content: &str) -> Option<String> {
 }
 
 fn is_clipaste_health(body: &str) -> bool {
-    body.replace(' ', "").contains("\"status\":\"ok\"")
+    let compact = body.replace(' ', "");
+    compact.contains("\"status\":\"ok\"") && compact.contains("\"auth\":\"bearer\"")
 }
 
 /// Extract `"version":"x.y.z"` from a /health body, for reporting a version skew
@@ -299,8 +321,11 @@ fn diagnose_role(role: Role) -> Report {
 
     if which("curl").is_none() {
         checks.push(
-            Check::fail("curl", "curl not found on PATH — every clipaste transfer uses it")
-                .with_fix(curl_install_hint()),
+            Check::fail(
+                "curl",
+                "curl not found on PATH — every clipaste transfer uses it",
+            )
+            .with_fix(curl_install_hint()),
         );
     }
 
@@ -324,9 +349,9 @@ fn curl_install_hint() -> &'static str {
 
 pub(crate) fn daemon_start_hint() -> &'static str {
     if cfg!(target_os = "macos") {
-        "brew services start clipaste"
+        "start the hardened fork's clipaste binary (see SECURITY.md); do not start the upstream Homebrew service"
     } else if cfg!(target_os = "windows") {
-        "start clipaste.exe (reinstall: irm https://raw.githubusercontent.com/hqhq1025/clipaste/main/install.ps1 | iex)"
+        "start the hardened fork's clipaste.exe; see SECURITY.md for source installation"
     } else {
         "run clipaste in your Linux graphical desktop session; leave it running"
     }
@@ -340,7 +365,10 @@ fn clipboard_host_checks() -> Vec<Check> {
     match crate::linux::detect() {
         Ok(backend) => {
             if let Some(warning) = backend.warning {
-                checks.push(Check::warn("backend", format!("{}; {warning}", backend.detail)));
+                checks.push(Check::warn(
+                    "backend",
+                    format!("{}; {warning}", backend.detail),
+                ));
             } else {
                 checks.push(Check::ok("backend", backend.detail));
             }
@@ -356,7 +384,10 @@ fn clipboard_host_checks() -> Vec<Check> {
             } else {
                 ""
             };
-            let mut detail = format!("daemon responding on 127.0.0.1:{}{mode}", common::DEFAULT_PORT);
+            let mut detail = format!(
+                "daemon responding on 127.0.0.1:{}{mode}",
+                common::DEFAULT_PORT
+            );
             if running != common::VERSION {
                 // A stale daemon is the classic "I upgraded but nothing changed"
                 // trap: the new binary is on disk, the old one still owns the port.
@@ -390,28 +421,51 @@ fn clipboard_host_checks() -> Vec<Check> {
     }
 
     // Only meaningful once the daemon answered; skip the noise otherwise.
-    if checks.iter().any(|c| c.name == "daemon" && c.status != Status::Fail) {
-        match common::http_get(&format!("{base}/clipboard/type")) {
-            Some(body) if body.contains("\"image\"") => {
-                checks.push(Check::ok("clipboard", "an image is staged and ready to serve"))
-            }
-            Some(_) => checks.push(Check::warn(
-                "clipboard",
-                "no image staged yet — take a screenshot, then re-run doctor",
+    if checks
+        .iter()
+        .any(|c| c.name == "daemon" && c.status != Status::Fail)
+    {
+        match security::load_token() {
+            Ok(token) => match security::http_get_authenticated(
+                &format!("{base}/clipboard/type"),
+                &token,
+            ) {
+                Some(body) if body.contains("\"image\"") => {
+                    checks.push(Check::ok("authentication", "private credential accepted"));
+                    checks.push(Check::ok(
+                        "clipboard",
+                        "an image is staged and ready to serve",
+                    ));
+                }
+                Some(body) if body.contains("\"empty\"") => {
+                    checks.push(Check::ok("authentication", "private credential accepted"));
+                    checks.push(Check::warn(
+                        "clipboard",
+                        "no image staged yet — copy a screenshot, then re-run doctor",
+                    ));
+                }
+                _ => checks.push(Check::fail(
+                    "authentication",
+                    "clipboard request refused; verify the token and restart the hardened daemon",
+                )),
+            },
+            Err(_) => checks.push(Check::fail(
+                "authentication",
+                "private token missing or unsafe; start the hardened daemon to create it",
             )),
-            None => checks.push(Check::warn("clipboard", "could not read clipboard state")),
         }
     }
 
     let cache = common::temp_dir();
-    common::ensure_temp_dir();
-    if cache.is_dir() {
-        checks.push(Check::ok("cache-dir", cache.display().to_string()));
-    } else {
-        checks.push(
-            Check::fail("cache-dir", format!("cannot create {}", cache.display()))
-                .with_fix(format!("mkdir -p {}", cache.display())),
-        );
+    match common::ensure_temp_dir() {
+        Ok(()) => checks.push(Check::ok("cache-dir", cache.display().to_string())),
+        Err(e) => checks.push(Check::fail(
+            "cache-dir",
+            format!(
+                "unsafe or unavailable cache directory {}: {e}",
+                cache.display()
+            ),
+        )),
     }
 
     checks
@@ -419,7 +473,7 @@ fn clipboard_host_checks() -> Vec<Check> {
 
 fn restart_hint() -> &'static str {
     if cfg!(target_os = "macos") {
-        "brew services restart clipaste"
+        "restart the hardened fork's clipaste process or your own LaunchAgent"
     } else if cfg!(target_os = "windows") {
         "taskkill /IM clipaste.exe /F, then start the new clipaste.exe"
     } else {
@@ -458,8 +512,10 @@ fn consumer_checks(role: Role) -> Vec<Check> {
     checks.push(Check::ok("helper", helper.display().to_string()));
 
     match which("clipaste-paste") {
-        Some(p) if p == helper => checks.push(Check::ok("helper-on-path", "clipaste-paste resolves")),
-        Some(p) => checks.push(Check::warn(
+        Some(p) if p == helper => {
+            checks.push(Check::ok("helper-on-path", "clipaste-paste resolves"))
+        }
+        Some(p) => checks.push(Check::fail(
             "helper-on-path",
             format!("clipaste-paste resolves to {} instead", p.display()),
         )),
@@ -486,16 +542,40 @@ fn consumer_checks(role: Role) -> Vec<Check> {
     match common::http_get(&format!("{url}/health")) {
         Some(body) if is_clipaste_health(&body) => {
             let v = health_version(&body).unwrap_or_else(|| "unknown".into());
-            checks.push(Check::ok("bridge", format!("{url} responding (daemon v{v})")));
+            checks.push(Check::ok(
+                "bridge",
+                format!("{url} responding (daemon v{v})"),
+            ));
+            match security::load_token() {
+                Ok(token) => {
+                    match security::http_get_authenticated(&format!("{url}/clipboard/type"), &token)
+                    {
+                        Some(state)
+                            if state.contains("\"image\"") || state.contains("\"empty\"") =>
+                        {
+                            checks.push(Check::ok(
+                                "authentication",
+                                "private credential accepted by clipboard host",
+                            ))
+                        }
+                        _ => checks.push(
+                            Check::fail("authentication", "clipboard host rejected the credential")
+                                .with_fix(&setup_hint),
+                        ),
+                    }
+                }
+                Err(_) => checks.push(
+                    Check::fail("authentication", "private token missing or unsafe")
+                        .with_fix(&setup_hint),
+                ),
+            }
         }
         _ => {
             let fix = match role {
                 Role::Wsl2 => "clipaste wsl-setup   # re-probe the Windows host address".to_string(),
                 _ => "reconnect: the SSH RemoteForward is only active inside a session opened after ssh-setup".to_string(),
             };
-            checks.push(
-                Check::fail("bridge", format!("{url} is not answering")).with_fix(fix),
-            );
+            checks.push(Check::fail("bridge", format!("{url} is not answering")).with_fix(fix));
         }
     }
 
@@ -506,8 +586,11 @@ fn consumer_checks(role: Role) -> Vec<Check> {
         let shim = bin.join("xclip");
         if !is_executable(&shim) {
             checks.push(
-                Check::warn("xclip-shim", "not installed — Ctrl+V in Claude Code will not fetch")
-                    .with_fix(&setup_hint),
+                Check::fail(
+                    "xclip-shim",
+                    "not installed — Ctrl+V in Claude Code will not fetch",
+                )
+                .with_fix(&setup_hint),
             );
         } else {
             match which("xclip") {
@@ -515,13 +598,13 @@ fn consumer_checks(role: Role) -> Vec<Check> {
                     checks.push(Check::ok("xclip-shim", "shim takes precedence on PATH"))
                 }
                 Some(p) => checks.push(
-                    Check::warn(
+                    Check::fail(
                         "xclip-shim",
                         format!("shadowed by {} — the real xclip wins on PATH", p.display()),
                     )
                     .with_fix("put $HOME/.local/bin BEFORE the system paths in PATH"),
                 ),
-                None => checks.push(Check::warn("xclip-shim", "installed but not on PATH")),
+                None => checks.push(Check::fail("xclip-shim", "installed but not on PATH")),
             }
         }
     } else if cfg!(target_os = "macos") {
@@ -545,7 +628,12 @@ fn render_human(r: &Report) -> String {
         r.role.as_str()
     ));
     for c in &r.checks {
-        out.push_str(&format!("  {} {:<14} {}\n", c.status.glyph(), c.name, c.detail));
+        out.push_str(&format!(
+            "  {} {:<14} {}\n",
+            c.status.glyph(),
+            c.name,
+            c.detail
+        ));
         if let Some(fix) = &c.fix {
             out.push_str(&format!("      → {fix}\n"));
         }
@@ -606,14 +694,35 @@ mod tests {
 
     #[test]
     fn role_detection_preserves_existing_consumers_and_supported_hosts() {
-        assert_eq!(classify_role("linux", false, true, false, true), Role::SshRemote);
-        assert_eq!(classify_role("linux", false, false, true, false), Role::SshRemote);
-        assert_eq!(classify_role("linux", false, false, true, true), Role::ClipboardHost);
+        assert_eq!(
+            classify_role("linux", false, true, false, true),
+            Role::SshRemote
+        );
+        assert_eq!(
+            classify_role("linux", false, false, true, false),
+            Role::SshRemote
+        );
+        assert_eq!(
+            classify_role("linux", false, false, true, true),
+            Role::ClipboardHost
+        );
         assert_eq!(classify_role("linux", true, true, true, true), Role::Wsl2);
-        assert_eq!(classify_role("macos", false, true, true, true), Role::SshRemote);
-        assert_eq!(classify_role("macos", false, false, true, true), Role::ClipboardHost);
-        assert_eq!(classify_role("windows", true, false, true, true), Role::ClipboardHost);
-        assert_eq!(classify_role("freebsd", false, false, false, false), Role::UnsupportedHost);
+        assert_eq!(
+            classify_role("macos", false, true, true, true),
+            Role::SshRemote
+        );
+        assert_eq!(
+            classify_role("macos", false, false, true, true),
+            Role::ClipboardHost
+        );
+        assert_eq!(
+            classify_role("windows", true, false, true, true),
+            Role::ClipboardHost
+        );
+        assert_eq!(
+            classify_role("freebsd", false, false, false, false),
+            Role::UnsupportedHost
+        );
     }
 
     #[test]
@@ -645,12 +754,19 @@ mod tests {
             None
         );
         assert_eq!(parse_helper_url("no url here\n"), None);
+        assert_eq!(
+            parse_helper_url("CLIPASTE_URL='http://127.0.0.1:18340'\n").as_deref(),
+            Some("http://127.0.0.1:18340")
+        );
     }
 
     #[test]
     fn reads_health_fields() {
-        let body = "{\"status\":\"ok\",\"version\":\"2.4.1\"}";
+        let body = "{\"status\":\"ok\",\"version\":\"2.4.1\",\"auth\":\"bearer\"}";
         assert!(is_clipaste_health(body));
+        assert!(!is_clipaste_health(
+            "{\"status\":\"ok\",\"version\":\"2.5.0\"}"
+        ));
         assert_eq!(health_version(body).as_deref(), Some("2.4.1"));
         assert!(!is_clipaste_health("<html>nginx</html>"));
         assert_eq!(health_version("{\"status\":\"ok\"}"), None);
@@ -671,9 +787,17 @@ mod tests {
 
     #[test]
     fn worst_status_and_exit_code() {
-        let mk = |s: Status| Check { name: "x", status: s, detail: String::new(), fix: None };
+        let mk = |s: Status| Check {
+            name: "x",
+            status: s,
+            detail: String::new(),
+            fix: None,
+        };
 
-        let ok = Report { role: Role::ClipboardHost, checks: vec![mk(Status::Ok)] };
+        let ok = Report {
+            role: Role::ClipboardHost,
+            checks: vec![mk(Status::Ok)],
+        };
         assert_eq!(ok.worst(), Status::Ok);
         assert_eq!(ok.exit_code(), 0);
 

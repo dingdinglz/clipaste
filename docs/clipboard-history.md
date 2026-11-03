@@ -1,6 +1,10 @@
 # Clipboard History Compatibility
 
-On macOS, Clipaste publishes a single pasteboard item containing the original
+This fork defaults to `CLIPASTE_SERVER_ONLY=1`: the local clipboard is untouched.
+The normalization behavior below applies only after explicitly opting in with
+`CLIPASTE_SERVER_ONLY=0`.
+
+In that optional mode on macOS, Clipaste publishes a single pasteboard item containing the original
 representations plus a PNG, legacy PNGf, file URL, and plain-text file path.
 `x.nspasteboard.ModifiedType` identifies the change count that was enriched.
 Maccy 2.6.1 understands this marker and replaces an already-recorded original
@@ -33,13 +37,15 @@ Unix cache filesystems must support hard links (such as APFS). Windows uses a
 same-volume, non-overwriting move, including on FAT/exFAT. Publication failures
 are reported instead of exposing partially written files.
 
-Published images, including legacy timestamp filenames, no longer expire after
-one hour. Clipboard managers and pasted terminal paths can retain references
-indefinitely, and Clipaste cannot determine when every consumer has released
-them. Disk usage grows with unique images. Explicitly deleting cache files
-reclaims space but invalidates any saved file-path references; embedded image
-bytes in a clipboard manager may remain available. Clipaste does not upload
-the cache, change its loopback HTTP bind, or extend sharing to new hosts.
+This fork expires published images after one hour by default. Cleanup runs at
+startup and roughly once per minute while running; expired images cannot be
+fetched over HTTP even before cleanup. Stopping the daemon delays deletion until
+the next run. Recopying the same image can refresh its timestamp.
+`CLIPASTE_CACHE_TTL_SECONDS=0` explicitly opts into indefinite retention.
+
+Expiry invalidates file-path references in history managers. Embedded image
+bytes, backups and snapshots may remain; cache deletion is not secure erasure.
+Authenticated endpoints and the trust boundary are described in SECURITY.md.
 
 Existing duplicate history entries and missing legacy files need a separate,
 backed-up repair. Stop the history manager before modifying its database,
@@ -56,7 +62,8 @@ and multi-item/private exclusions, plus isolated cache identity, permissions,
 corruption, publication, and lifetime tests. Tests do not alter the general
 clipboard or real home directory.
 
-For a real Maccy check, let Maccy record a test PNG while Clipaste is stopped,
+Only with explicit user permission and optional normalization enabled, for a
+real Maccy check let Maccy record a test PNG while Clipaste is stopped,
 then start Clipaste and confirm only one active history item contains those PNG
 bytes. Repeat copying the same PNG, restore it through Maccy, and confirm its
 cached file and local HTTP image response still contain the original bytes.

@@ -20,10 +20,15 @@ binary = os.environ["CLIPASTE_TEST_BINARY"]
 base = "http://127.0.0.1:18340"
 owners = []
 owner_logs = []
+token_file = None
 
 
 def get(path):
-    with urllib.request.urlopen(base + path, timeout=2) as response:
+    headers = {}
+    if path.startswith('/clipboard/') and token_file is not None and token_file.exists():
+        headers['Authorization'] = 'Bearer ' + token_file.read_text().strip()
+    request = urllib.request.Request(base + path, headers=headers)
+    with urllib.request.urlopen(request, timeout=2) as response:
         return response.status, response.read()
 
 
@@ -69,7 +74,9 @@ def stop(proc):
 
 with tempfile.TemporaryDirectory(prefix="clipaste-smoke-") as temp:
     env = dict(os.environ, HOME=temp, XDG_CACHE_HOME=temp + "/cache",
-               CLIPASTE_BACKEND=mode)
+               XDG_CONFIG_HOME=temp + "/config", CLIPASTE_BACKEND=mode,
+               CLIPASTE_CACHE_TTL_SECONDS="3600")
+    token_file = Path(temp) / "config/clipaste/token"
     for key in ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "WSL_DISTRO_NAME", "WSL_INTEROP"]:
         env.pop(key, None)
     log = open(temp + "/daemon.log", "w+")
@@ -86,6 +93,13 @@ with tempfile.TemporaryDirectory(prefix="clipaste-smoke-") as temp:
                                   start_new_session=True)
         wait_for(lambda: get("/clipboard/image") == (200, first), "first PNG not served")
         assert subprocess.check_output(reader) == first, "watcher modified clipboard"
+        for headers in [{}, {'Authorization': 'Bearer ' + '0' * 64}]:
+            try:
+                urllib.request.urlopen(urllib.request.Request(base + '/clipboard/image', headers=headers), timeout=2)
+            except urllib.error.HTTPError as error:
+                assert error.code == 401
+            else:
+                raise AssertionError('clipboard was readable without a valid token')
         health = json.loads(get("/health")[1])
         assert health["status"] == "ok"
         doctor = subprocess.run([binary, "doctor", "--json"], env=env,
@@ -100,8 +114,10 @@ with tempfile.TemporaryDirectory(prefix="clipaste-smoke-") as temp:
         consumer_home = Path(temp) / "consumer"
         consumer_home.mkdir()
         consumer_env = dict(env, HOME=str(consumer_home), WSL_DISTRO_NAME="Test",
+                            XDG_CONFIG_HOME=str(consumer_home / '.config'),
                             TMPDIR=str(consumer_home))
-        setup = subprocess.run([binary, "wsl-setup", "--host", "127.0.0.1"],
+        setup = subprocess.run([binary, "wsl-setup", "--host", "127.0.0.1",
+                                "--token-file", str(token_file)],
                                env=consumer_env, capture_output=True, timeout=15)
         assert setup.returncode == 0, setup.stderr
         helper = consumer_home / ".local/bin/clipaste-paste"
@@ -130,7 +146,7 @@ with tempfile.TemporaryDirectory(prefix="clipaste-smoke-") as temp:
         assert original_path.read_bytes() == first, "historical image was deleted"
         copy(first)
         wait_for(lambda: get("/clipboard/image") == (200, first), "recopy not captured")
-        assert original_path.stat().st_mtime_ns == original_time
+        assert original_path.stat().st_mtime_ns >= original_time, "recopy must refresh cache retention"
         assert len(list(cache.glob("*.png"))) == 2
         assert (cache.stat().st_mode & 0o777) == 0o700
         assert all(p.stat().st_mode & 0o777 == 0o600 for p in cache.glob("*.png"))

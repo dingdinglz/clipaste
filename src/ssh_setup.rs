@@ -1,440 +1,446 @@
-use crate::common;
-use std::io::Write;
-use std::process::Command;
+use crate::{common, security};
+use std::io::{Read, Write};
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-/// xclip shim template — {CLIPASTE_URL} will be replaced at install time
-const XCLIP_SHIM_TEMPLATE: &str = r#"#!/bin/bash
-# clipaste xclip shim — intercepts xclip calls and fetches images from clipaste
-# Installed by: clipaste wsl-setup
+// All helpers fail closed on authentication, transport, or malformed-response
+// errors. Only a successful `type: empty` response permits native fallback.
+// Non-clipboard invocations still go directly to the real tool, with argv intact.
+const HELPER_COMMON: &str = r#"
+set +x
+umask 077
+CLIPASTE_URL='__CLIPASTE_URL__'
+clipaste_die() { printf 'clipaste: %s\n' "$*" >&2; exit 1; }
+clipaste_mode() {
+    if [ "$(uname -s)" = Darwin ]; then stat -f '%Lp' "$1"; else stat -c '%a' "$1"; fi
+}
+clipaste_links() {
+    if [ "$(uname -s)" = Darwin ]; then stat -f '%l' "$1"; else stat -c '%h' "$1"; fi
+}
+clipaste_size() {
+    if [ "$(uname -s)" = Darwin ]; then stat -f '%z' "$1"; else stat -c '%s' "$1"; fi
+}
+# Check every component, not just the final path (including dangling links).
+clipaste_check_chain() {
+    local p="$1"
+    case "$p" in /*) ;; *) clipaste_die 'an absolute HOME/config/cache path is required';; esac
+    while [ "$p" != / ]; do
+        [ ! -L "$p" ] || clipaste_die "refusing symlink: $p"
+        if [ -e "$p" ]; then
+            [ -d "$p" ] || clipaste_die "not a directory: $p"
+            local mode
+            mode=$(clipaste_mode "$p")
+            # Shared sticky ancestors (/tmp) are safe; writable non-sticky
+            # parents would let another user replace a private child directory.
+            (( (8#$mode & 0022) == 0 || (8#$mode & 01000) != 0 )) || clipaste_die "unsafe writable directory: $p"
+        fi
+        p="${p%/*}"; [ -n "$p" ] || p=/
+    done
+}
+clipaste_private_dir() {
+    clipaste_check_chain "$1"
+    if [ ! -e "$1" ]; then mkdir -p "$1" || clipaste_die 'cannot create private directory'; fi
+    [ -d "$1" ] && [ -O "$1" ] && [ "$(clipaste_mode "$1")" = 700 ] || clipaste_die "directory must be owned by you and mode 0700: $1"
+}
+clipaste_private_file() {
+    [ ! -L "$1" ] && [ -f "$1" ] && [ -O "$1" ] &&
+        [ "$(clipaste_mode "$1")" = 600 ] && [ "$(clipaste_links "$1")" = 1 ] || clipaste_die "unsafe private file: $1"
+}
+clipaste_read_token() {
+    clipaste_private_file "$1"
+    local size
+    size=$(clipaste_size "$1")
+    [ "$size" = 64 ] || [ "$size" = 65 ] || clipaste_die 'invalid token length'
+    clipaste_token=$(cat "$1") || clipaste_die 'cannot read token'
+    export -n clipaste_token
+    [[ "$clipaste_token" =~ ^[0-9a-f]{64}$ ]] || clipaste_die 'invalid token; rerun setup'
+}
+clipaste_load_token() {
+    local d="${XDG_CONFIG_HOME:-$HOME/.config}/clipaste"
+    clipaste_check_chain "$d"
+    [ -d "$d" ] && [ -O "$d" ] && [ "$(clipaste_mode "$d")" = 700 ] || clipaste_die 'missing or unsafe token directory; rerun setup'
+    clipaste_read_token "$d/token"
+}
+clipaste_curl() {
+    printf 'header = "Authorization: Bearer %s"\n' "$clipaste_token" |
+        curl -q --config - --noproxy '*' --connect-timeout 2 --max-time 10 --fail --silent "$@"
+}
+clipaste_type() {
+    clipaste_load_token
+    local body
+    body=$(clipaste_curl "$CLIPASTE_URL/clipboard/type") || clipaste_die 'authentication or transport failed (no native fallback)'
+    body=$(printf '%s' "$body" | tr -d '[:space:]')
+    case "$body" in
+        '{"type":"image","format":"png"}') clipaste_kind=image ;;
+        '{"type":"empty"}') clipaste_kind=empty ;;
+        *) clipaste_die 'invalid clipboard response (no native fallback)' ;;
+    esac
+}
+clipaste_tmp=''
+clipaste_reservation=''
+clipaste_cleanup() {
+    if [ -n "$clipaste_tmp" ]; then rm -f "$clipaste_tmp"; fi
+    if [ -n "$clipaste_reservation" ]; then rm -f "$clipaste_reservation"; fi
+}
+trap clipaste_cleanup EXIT
+trap 'exit 1' HUP INT TERM
+clipaste_fetch() {
+    local cache="${XDG_CACHE_HOME:-$HOME/.cache}/clipaste"
+    clipaste_private_dir "$cache"
+    clipaste_private_dir "$cache/paste"
+    # This directory is dedicated to our private managed downloads. Do not
+    # traverse directories, links, or remove other names/owners/permissions.
+    find "$cache/paste/." ! -name . -prune -type f -name 'clipaste-image.*' -user "$(id -u)" -links 1 -perm 0600 -mmin +59 -exec rm -f {} + || clipaste_die 'cannot expire managed images'
+    # BSD mktemp appends random characters if Xs are followed by .png. Reserve
+    # a portable template first, then publish a .png name without overwriting.
+    clipaste_tmp=$(mktemp "$cache/paste/clipaste-image.XXXXXXXX") || clipaste_die 'mktemp failed'
+    ln "$clipaste_tmp" "$clipaste_tmp.png" || clipaste_die 'cannot reserve PNG filename'
+    clipaste_reservation="$clipaste_tmp"
+    clipaste_tmp="$clipaste_tmp.png"
+    rm -f "$clipaste_reservation" || clipaste_die 'cannot release filename reservation'
+    clipaste_reservation=''
+    chmod 600 "$clipaste_tmp" || clipaste_die 'cannot secure image'
+    clipaste_curl -o "$clipaste_tmp" "$CLIPASTE_URL/clipboard/image" && [ -s "$clipaste_tmp" ] || clipaste_die 'image fetch failed (no native fallback)'
+}
+clipaste_native() {
+    local tool="$1" rest="$PATH" dir candidate
+    shift
+    while :; do
+        dir=${rest%%:*}
+        # Exclude the shim directory in *every* PATH position, including last.
+        if [ -n "$dir" ] && [ "$dir" != "$HOME/.local/bin" ]; then
+            candidate="$dir/$tool"
+            if [ -x "$candidate" ] && [ ! -d "$candidate" ] && ! [ "$candidate" -ef "$0" ]; then
+                exec "$candidate" "$@"
+            fi
+        fi
+        case "$rest" in *:*) rest=${rest#*:} ;; *) break ;; esac
+    done
+    clipaste_die "$tool not found outside the shim directory"
+}
+"#;
 
-CLIPASTE_URL="__CLIPASTE_URL__"
-REAL_XCLIP="$(PATH=$(echo "$PATH" | sed "s|$HOME/.local/bin:||g") command -v xclip 2>/dev/null)"
-
+const XCLIP_BODY: &str = r#"
 case "$*" in
     *"-selection clipboard"*"-t TARGETS"*"-o"*|*"-sel clip"*"-t TARGETS"*"-o"*)
-        if curl -sf "${CLIPASTE_URL}/clipboard/type" 2>/dev/null | grep -q '"image"'; then
-            echo "TARGETS"
-            echo "image/png"
-            exit 0
-        fi
+        clipaste_type
+        if [ "$clipaste_kind" = image ]; then printf 'TARGETS\nimage/png\n'; exit 0; fi
         ;;
     *"-selection clipboard"*"-t image/png"*"-o"*|*"-sel clip"*"-t image/png"*"-o"*)
-        tmpfile=$(mktemp /tmp/clipaste-remote-XXXXXX.png)
-        if curl -sf -o "$tmpfile" "${CLIPASTE_URL}/clipboard/image" 2>/dev/null; then
-            if [ -s "$tmpfile" ]; then
-                cat "$tmpfile"
-                rm -f "$tmpfile"
-                exit 0
-            fi
-        fi
-        rm -f "$tmpfile"
+        clipaste_type
+        if [ "$clipaste_kind" = image ]; then clipaste_fetch; cat "$clipaste_tmp"; exit $?; fi
         ;;
 esac
-
-if [ -n "$REAL_XCLIP" ] && [ -x "$REAL_XCLIP" ]; then
-    exec "$REAL_XCLIP" "$@"
-else
-    echo "xclip not found" >&2
-    exit 1
-fi
+clipaste_native xclip "$@"
 "#;
-
-const WL_PASTE_SHIM_TEMPLATE: &str = r#"#!/bin/bash
-# clipaste wl-paste shim — for Wayland environments
-# Installed by: clipaste wsl-setup
-
-CLIPASTE_URL="__CLIPASTE_URL__"
-REAL_WL_PASTE="$(PATH=$(echo "$PATH" | sed "s|$HOME/.local/bin:||g") command -v wl-paste 2>/dev/null)"
-
+const WL_PASTE_BODY: &str = r#"
 case "$*" in
     *"--list-types"*)
-        if curl -sf "${CLIPASTE_URL}/clipboard/type" 2>/dev/null | grep -q '"image"'; then
-            echo "image/png"
-            echo "text/plain"
-            exit 0
-        fi
+        clipaste_type
+        if [ "$clipaste_kind" = image ]; then printf 'image/png\n'; exit 0; fi
         ;;
     *"--type image/"*|*"-t image/"*)
-        tmpfile=$(mktemp /tmp/clipaste-remote-XXXXXX.png)
-        if curl -sf -o "$tmpfile" "${CLIPASTE_URL}/clipboard/image" 2>/dev/null; then
-            if [ -s "$tmpfile" ]; then
-                cat "$tmpfile"
-                rm -f "$tmpfile"
-                exit 0
-            fi
-        fi
-        rm -f "$tmpfile"
+        clipaste_type
+        if [ "$clipaste_kind" = image ]; then clipaste_fetch; cat "$clipaste_tmp"; exit $?; fi
         ;;
 esac
-
-if [ -n "$REAL_WL_PASTE" ] && [ -x "$REAL_WL_PASTE" ]; then
-    exec "$REAL_WL_PASTE" "$@"
-else
-    echo "wl-paste not found" >&2
-    exit 1
-fi
+clipaste_native wl-paste "$@"
+"#;
+const PASTE_BODY: &str = r#"
+clipaste_type
+[ "$clipaste_kind" = image ] || clipaste_die 'no image on clipboard; take a screenshot first'
+clipaste_fetch
+printf '%s\n' "$clipaste_tmp"
+# The printed file stays usable for one hour; subsequent helper calls expire it.
+clipaste_tmp=''
 "#;
 
-/// clipaste-paste helper — fetches the current clipboard image into a real file
-/// on the remote host and prints its path. Unlike the xclip/wl-paste shims (which
-/// only work for tools that shell out to those commands, e.g. Claude Code), this
-/// works for ANY tool that accepts an image file path — including Codex CLI, which
-/// reads the clipboard in-process via X11/NSPasteboard and bypasses the shims.
-/// Also the only working path on a macOS remote (where xclip/wl-paste don't apply).
-const CLIPASTE_PASTE_TEMPLATE: &str = r#"#!/bin/bash
-# clipaste-paste — fetch the current clipboard image from your LOCAL machine
-# (through the clipaste SSH tunnel / WSL bridge) into a real file on THIS host,
-# then print the path. Use it when your tool can't read the clipboard directly:
-#   - Codex CLI (reads clipboard in-process, bypasses the xclip shim)
-#   - any macOS remote (xclip/wl-paste don't apply there)
-#
-# Usage: run `clipaste-paste`, then hand the printed path to your tool.
-# Installed by: clipaste ssh-setup / clipaste wsl-setup
-
-CLIPASTE_URL="__CLIPASTE_URL__"
-
-if ! curl -sf "${CLIPASTE_URL}/clipboard/type" 2>/dev/null | grep -q '"image"'; then
-    echo "clipaste-paste: no image on clipboard — take a screenshot (or copy an image file) on your local machine first" >&2
-    exit 1
-fi
-
-out="${TMPDIR:-/tmp}"
-out="${out%/}/clipaste-$(date +%s)-$$.png"
-if curl -sf -o "$out" "${CLIPASTE_URL}/clipboard/image" 2>/dev/null && [ -s "$out" ]; then
-    echo "$out"
-    exit 0
-fi
-
-rm -f "$out"
-echo "clipaste-paste: failed to fetch image from ${CLIPASTE_URL} (is the clipaste daemon running locally and the tunnel up?)" >&2
-exit 1
-"#;
-
-/// Shell snippet (shared by the local WSL install and the remote SSH install)
-/// that puts `~/.local/bin` on PATH.
-///
-/// The previous version only appended to rc files that *already existed*, so on
-/// a host where neither `~/.bashrc` nor `~/.zshrc` is present — common on a
-/// fresh macOS remote, where zsh works fine without a `~/.zshrc` — the shims
-/// were installed but never reachable, and `clipaste-paste` came back as
-/// "command not found". We now fall back to creating the rc file for the login
-/// shell.
-const ENSURE_PATH_SNIPPET: &str = r#"
-clipaste_ensure_path() {
-    rc="$1"
-    [ -e "$rc" ] || : > "$rc"
-    if ! grep -q 'clipaste PATH' "$rc" 2>/dev/null; then
-        printf '\n# clipaste PATH\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$rc"
-    fi
-}
-
-if ! echo "$PATH" | grep -q "$HOME/.local/bin"; then
-    clipaste_touched=0
-    for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
-        if [ -f "$rc" ]; then
-            clipaste_ensure_path "$rc"
-            clipaste_touched=1
-        fi
-    done
-    if [ "$clipaste_touched" = "0" ]; then
-        case "${SHELL##*/}" in
-            zsh) clipaste_ensure_path "$HOME/.zshrc" ;;
-            *)   clipaste_ensure_path "$HOME/.bashrc" ;;
-        esac
-    fi
-fi
-"#;
-
-/// Append `-p PORT` to an ssh argument list when a custom SSH port is given.
-fn ssh_port_args(ssh_port: Option<u16>) -> Vec<String> {
-    match ssh_port {
-        Some(p) => vec!["-p".to_string(), p.to_string()],
-        None => vec![],
-    }
-}
-
-/// Render the remote `bash -s` payload. Split out from [`install_shims_via_ssh`]
-/// so a test can syntax-check it locally — a typo in this generated script would
-/// otherwise only ever surface on someone else's remote host.
-fn build_remote_setup_script(clipaste_url: &str) -> String {
-    let xclip_shim = XCLIP_SHIM_TEMPLATE.replace("__CLIPASTE_URL__", clipaste_url);
-    let wl_paste_shim = WL_PASTE_SHIM_TEMPLATE.replace("__CLIPASTE_URL__", clipaste_url);
-    let clipaste_paste = CLIPASTE_PASTE_TEMPLATE.replace("__CLIPASTE_URL__", clipaste_url);
-
+fn helper_script(name: &str, url: &str) -> String {
+    let body = match name {
+        "xclip" => XCLIP_BODY,
+        "wl-paste" => WL_PASTE_BODY,
+        "clipaste-paste" => PASTE_BODY,
+        _ => unreachable!("internal helper name"),
+    };
     format!(
-        r#"
-set -e
-OS="$(uname -s)"
-mkdir -p ~/.local/bin
-
-# clipaste-paste: universal helper, installed on every platform
-cat > ~/.local/bin/clipaste-paste << 'SHIMEOF'
-{clipaste_paste}
-SHIMEOF
-chmod +x ~/.local/bin/clipaste-paste
-
-# xclip/wl-paste shims: only meaningful on Linux
-if [ "$OS" = "Linux" ]; then
-cat > ~/.local/bin/xclip << 'SHIMEOF'
-{xclip_shim}
-SHIMEOF
-chmod +x ~/.local/bin/xclip
-
-cat > ~/.local/bin/wl-paste << 'SHIMEOF'
-{wl_paste_shim}
-SHIMEOF
-chmod +x ~/.local/bin/wl-paste
-fi
-
-# Ensure ~/.local/bin is in PATH
-{ensure_path}
-echo "CLIPASTE_OS=$OS"
-echo "OK"
-"#,
-        ensure_path = ENSURE_PATH_SNIPPET,
+        "#!/bin/bash\n# clipaste managed helper v2: {name}\n{}{body}",
+        HELPER_COMMON.replace("__CLIPASTE_URL__", url)
     )
 }
 
-/// Install shims on the remote and report the detected remote OS ("Darwin" /
-/// "Linux" / "Unknown").
-///
-/// A single remote `bash -s` invocation detects the OS via `uname -s` and then
-/// always installs `clipaste-paste` (works for every tool, every OS), but
-/// installs the xclip/wl-paste shims only on Linux (they are useless on macOS,
-/// where tools read the pasteboard directly rather than via xclip). Doing the OS
-/// branch on the remote avoids a second ssh round-trip / password prompt and
-/// keeps the remote authoritative about its own platform.
+// Shared local/remote installer: first preflight *all* destinations, then stage
+// private files and rename them. No installed executable contains a secret.
+const INSTALL_PREFLIGHT: &str = r#"
+set -eu
+export -n clipaste_token
+[[ "$clipaste_token" =~ ^[0-9a-f]{64}$ ]] || clipaste_die 'invalid setup token'
+OS=$(uname -s)
+bin="$HOME/.local/bin"
+config="${XDG_CONFIG_HOME:-$HOME/.config}/clipaste"
+clipaste_check_chain "$bin"
+clipaste_check_chain "$config"
+# A same-user process can edit its own scripts. Only exact leading markers on
+# owned, non-writable-by-others regular files count, never a substring comment.
+clipaste_owned_file() {
+    [ ! -L "$1" ] && [ -f "$1" ] && [ -O "$1" ] && [ "$(clipaste_links "$1")" = 1 ] || clipaste_die "refusing unsafe file: $1"
+    local mode
+    mode=$(clipaste_mode "$1")
+    (( (8#$mode & 0022) == 0 )) || clipaste_die "file writable by others: $1"
+}
+clipaste_safe_dir() {
+    if [ -e "$1" ]; then
+        [ -O "$1" ] || clipaste_die "directory not owned by you: $1"
+        local mode
+        mode=$(clipaste_mode "$1")
+        (( (8#$mode & 0022) == 0 )) || clipaste_die "directory writable by others: $1"
+    fi
+}
+clipaste_safe_dir "$HOME"
+clipaste_safe_dir "$HOME/.local"
+clipaste_safe_dir "$bin"
+clipaste_safe_dir "${XDG_CONFIG_HOME:-$HOME/.config}"
+if [ -e "$config" ]; then
+    [ -O "$config" ] && [ "$(clipaste_mode "$config")" = 700 ] || clipaste_die 'unsafe token directory'
+fi
+if [ -e "$config/token" ] || [ -L "$config/token" ]; then
+    # Subshell validates the existing credential without replacing the newly
+    # supplied setup token. Never overwrite an arbitrary file named token.
+    ( clipaste_read_token "$config/token" )
+fi
+names=(clipaste-paste)
+if [ "$OS" = Linux ]; then names+=(xclip wl-paste); fi
+for name in "${names[@]}"; do
+    dest="$bin/$name"
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        clipaste_owned_file "$dest"
+        header=$(head -n 2 "$dest")
+        expected=$(printf '#!/bin/bash\n# clipaste managed helper v2: %s' "$name")
+        if [ "$header" != "$expected" ]; then
+            # Exact upstream headers allow upgrading the original owned shims.
+            case "$name" in
+                xclip) legacy=$(printf '#!/bin/bash\n# clipaste xclip shim — intercepts xclip calls and fetches images from clipaste\n# Installed by: clipaste wsl-setup') ;;
+                wl-paste) legacy=$(printf '#!/bin/bash\n# clipaste wl-paste shim — for Wayland environments\n# Installed by: clipaste wsl-setup') ;;
+                clipaste-paste) legacy=$(printf '#!/bin/bash\n# clipaste-paste — fetch the current clipboard image from your LOCAL machine\n# (through the clipaste SSH tunnel / WSL bridge) into a real file on THIS host,') ;;
+            esac
+            [ "$(head -n 3 "$dest")" = "$legacy" ] || clipaste_die "refusing unknown helper: $dest (move it aside manually)"
+        fi
+    fi
+done
+rcs=()
+# Merely being present is insufficient: native tools earlier in PATH would
+# bypass the bridge. Future shells must put the managed directory first.
+if [ "${PATH%%:*}" != "$HOME/.local/bin" ]; then
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+        if [ -e "$rc" ] || [ -L "$rc" ]; then
+            clipaste_owned_file "$rc"
+            rcs+=("$rc")
+        fi
+    done
+    if [ "${#rcs[@]}" = 0 ]; then
+        case "${SHELL:-}" in */zsh|zsh) rcs+=("$HOME/.zshrc") ;; *) rcs+=("$HOME/.bashrc") ;; esac
+    fi
+fi
+# No writes above this point.
+mkdir -p "$bin"
+clipaste_private_dir "$config"
+stage=''
+token_stage=''
+rc_stage=''
+clipaste_install_cleanup() {
+    [ -z "$stage" ] || rm -rf "$stage"
+    [ -z "$token_stage" ] || rm -f "$token_stage"
+    [ -z "$rc_stage" ] || rm -f "$rc_stage"
+    :
+}
+trap clipaste_install_cleanup EXIT
+trap 'exit 1' HUP INT TERM
+stage=$(mktemp -d "$bin/.clipaste-setup.XXXXXXXX")
+chmod 700 "$stage"
+token_stage=$(mktemp "$config/.token.XXXXXXXX")
+printf '%s\n' "$clipaste_token" > "$token_stage"
+chmod 600 "$token_stage"
+unset clipaste_token
+"#;
+
+const INSTALL_FINISH: &str = r#"
+for name in "${names[@]}"; do chmod 700 "$stage/$name"; done
+mv -f "$token_stage" "$config/token"
+token_stage=''
+for name in "${names[@]}"; do mv -f "$stage/$name" "$bin/$name"; done
+for rc in "${rcs[@]}"; do
+    if [ -f "$rc" ] && grep -Fqx 'export PATH="$HOME/.local/bin:$PATH"' "$rc"; then continue; fi
+    rc_stage=$(mktemp "$rc.clipaste.XXXXXXXX")
+    if [ -f "$rc" ]; then cat "$rc" > "$rc_stage"; fi
+    printf '\n# clipaste PATH\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$rc_stage"
+    chmod 600 "$rc_stage"
+    mv -f "$rc_stage" "$rc"
+    rc_stage=''
+done
+printf 'CLIPASTE_OS=%s\nOK\n' "$OS"
+"#;
+
+fn build_remote_setup_script(url: &str, token: &str) -> Result<String, String> {
+    validate_base_url(url)?;
+    if !security::valid_token(token) {
+        return Err("invalid setup token".into());
+    }
+    // SSH stdin only. set +x precedes the secret even under `bash -x`.
+    let mut script = format!(
+        "set +x\nunset clipaste_token\nread -r clipaste_token <<'CLIPASTE_TOKEN_EOF'\n{token}\nCLIPASTE_TOKEN_EOF\n"
+    );
+    script.push_str(&HELPER_COMMON.replace("__CLIPASTE_URL__", url));
+    script.push_str(INSTALL_PREFLIGHT);
+    for name in ["clipaste-paste", "xclip", "wl-paste"] {
+        script.push_str(&format!(
+            "cat > \"$stage/{name}\" <<'CLIPASTE_HELPER_EOF'\n{}CLIPASTE_HELPER_EOF\n",
+            helper_script(name, url)
+        ));
+    }
+    script.push_str(INSTALL_FINISH);
+    Ok(script)
+}
+
+fn ssh_port_args(port: Option<u16>) -> Vec<String> {
+    port.map(|p| vec!["-p".into(), p.to_string()])
+        .unwrap_or_default()
+}
+
+fn run_payload(mut command: Command, script: &str, token: &str) -> Result<String, String> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot start installer: {e}"))?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or("installer stdin unavailable")?
+        .write_all(script.as_bytes());
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("waiting for installer: {e}"))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr).replace(token, "[REDACTED]");
+        return Err(format!(
+            "installer failed; it may have partially installed files: {}",
+            err.trim()
+        ));
+    }
+    write_result.map_err(|e| format!("sending setup payload: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).replace(token, "[REDACTED]");
+    Ok(stdout
+        .lines()
+        .find_map(|s| s.strip_prefix("CLIPASTE_OS="))
+        .unwrap_or("Unknown")
+        .to_owned())
+}
+
 fn install_shims_via_ssh(
     host: &str,
-    clipaste_url: &str,
-    ssh_port: Option<u16>,
+    url: &str,
+    port: Option<u16>,
+    token: &str,
 ) -> Result<String, String> {
-    let setup_script = build_remote_setup_script(clipaste_url);
+    validate_ssh_host(host)?;
+    let script = build_remote_setup_script(url, token)?;
+    let mut command = Command::new("ssh");
+    command
+        .args(ssh_port_args(port))
+        .args(["-o", "ClearAllForwardings=yes"])
+        .arg("--")
+        .arg(host)
+        .arg("bash -s");
+    run_payload(command, &script, token)
+}
 
-    let mut args = ssh_port_args(ssh_port);
-    args.push(host.to_string());
-    args.push("bash -s".to_string());
+fn install_shims_locally(url: &str, token: &str) -> Result<(), String> {
+    let script = build_remote_setup_script(url, token)?;
+    run_payload(Command::new("bash"), &script, token).map(|_| ())
+}
 
-    let result = Command::new("ssh")
-        .args(&args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            child.stdin.take().unwrap().write_all(setup_script.as_bytes())?;
-            child.wait_with_output()
-        });
-
-    match result {
-        Ok(o) if o.status.success() => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            let os = stdout
-                .lines()
-                .find_map(|l| l.trim().strip_prefix("CLIPASTE_OS="))
-                .unwrap_or("Unknown")
-                .to_string();
-            Ok(os)
-        }
-        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-        Err(e) => Err(format!("SSH error: {e}")),
+fn verify_auth(url: &str, token: &str) -> Result<(), String> {
+    if !security::valid_token(token) {
+        return Err("invalid token".into());
+    }
+    match security::http_get_authenticated(&format!("{url}/clipboard/type"), token) {
+        Some(body) if body.contains("\"type\":\"image\"") || body.contains("\"type\":\"empty\"") => Ok(()),
+        _ => Err("authenticated /clipboard/type check failed; check the daemon and token (nothing installed)".into()),
     }
 }
-
-/// Write a shim script to `path` and mark it executable (best-effort, Unix).
-fn write_executable(path: &std::path::Path, content: &str, label: &str) -> Result<(), String> {
-    std::fs::write(path, content).map_err(|e| format!("write {label}: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).ok();
-    }
-    Ok(())
-}
-
-fn install_shims_locally(clipaste_url: &str) -> Result<(), String> {
-    let xclip_shim = XCLIP_SHIM_TEMPLATE.replace("__CLIPASTE_URL__", clipaste_url);
-    let wl_paste_shim = WL_PASTE_SHIM_TEMPLATE.replace("__CLIPASTE_URL__", clipaste_url);
-    let clipaste_paste = CLIPASTE_PASTE_TEMPLATE.replace("__CLIPASTE_URL__", clipaste_url);
-
-    let bin_dir = dirs_home().join(".local/bin");
-    std::fs::create_dir_all(&bin_dir).map_err(|e| format!("mkdir: {e}"))?;
-
-    write_executable(&bin_dir.join("xclip"), &xclip_shim, "xclip")?;
-    write_executable(&bin_dir.join("wl-paste"), &wl_paste_shim, "wl-paste")?;
-    write_executable(&bin_dir.join("clipaste-paste"), &clipaste_paste, "clipaste-paste")?;
-
-    ensure_local_bin_on_path();
-
-    Ok(())
-}
-
-/// Add `~/.local/bin` to PATH via the shell rc files, mirroring
-/// [`ENSURE_PATH_SNIPPET`] for the local (WSL) install.
-///
-/// Appends to every rc file that exists; if none does, creates the one matching
-/// the login shell. Best-effort — a failure here costs the user a manual PATH
-/// export, not a broken install, so it must not abort setup.
-fn ensure_local_bin_on_path() {
-    let home = dirs_home();
-    let candidates = [home.join(".bashrc"), home.join(".zshrc")];
-
-    let existing: Vec<_> = candidates.iter().filter(|p| p.is_file()).cloned().collect();
-    let to_patch = if existing.is_empty() {
-        let shell = std::env::var("SHELL").unwrap_or_default();
-        let rc = if shell.rsplit('/').next() == Some("zsh") {
-            home.join(".zshrc")
-        } else {
-            home.join(".bashrc")
-        };
-        vec![rc]
-    } else {
-        existing
-    };
-
-    for rc in to_patch {
-        let content = std::fs::read_to_string(&rc).unwrap_or_default();
-        if content.contains("clipaste PATH") {
-            continue;
-        }
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&rc) {
-            writeln!(f, "\n# clipaste PATH\nexport PATH=\"$HOME/.local/bin:$PATH\"").ok();
-        }
-    }
-}
-
-// ─── SSH Setup ───
 
 pub fn run_ssh(host: &str, ssh_port: Option<u16>) {
-    println!("clipaste ssh-setup for {host}");
-    if let Some(p) = ssh_port {
-        println!("(SSH port {p})");
-    }
-    println!();
-
-    // Step 1: Check local HTTP server
-    print!("[1/3] Checking local clipaste server... ");
-    std::io::stdout().flush().unwrap();
-    if !check_health(&format!("http://127.0.0.1:{}", common::DEFAULT_PORT)) {
-        println!("FAILED");
-        eprintln!("  clipaste daemon is not running. Start it first:");
-        eprintln!("  {}", crate::doctor::daemon_start_hint());
+    if let Err(e) = setup_ssh(host, ssh_port) {
+        eprintln!("clipaste ssh-setup: {e}");
         std::process::exit(1);
-    }
-    println!("OK");
-
-    // Step 2: Deploy shims to remote (also detects the remote OS)
-    let url = format!("http://127.0.0.1:{}", common::DEFAULT_PORT);
-    print!("[2/3] Installing helper on {host}... ");
-    std::io::stdout().flush().unwrap();
-    let remote_os = match install_shims_via_ssh(host, &url, ssh_port) {
-        Ok(os) => {
-            println!("OK ({os})");
-            os
-        }
-        Err(e) => {
-            println!("FAILED");
-            eprintln!("  {e}");
-            std::process::exit(1);
-        }
-    };
-
-    // Step 3: Configure SSH RemoteForward (+ custom Port)
-    print!("[3/3] Configuring SSH RemoteForward... ");
-    std::io::stdout().flush().unwrap();
-    match add_remote_forward(host, ssh_port) {
-        Ok(msg) => println!("{msg}"),
-        Err(e) => {
-            println!("FAILED");
-            eprintln!("  {e}");
-            std::process::exit(1);
-        }
-    }
-
-    println!();
-    println!("Setup complete!");
-    println!("  1. Open a NEW SSH session: ssh {host}");
-    println!("  2. Copy a screenshot/image to the clipboard on your local computer");
-    if remote_os == "Darwin" {
-        // macOS remote: xclip/wl-paste don't apply; tools read the *remote*
-        // (empty) pasteboard. The clipaste-paste helper is the working path.
-        println!("  3. In the remote shell, run: clipaste-paste");
-        println!("     then hand the printed path to Claude Code / Codex");
-        println!();
-        println!("Note: this is a macOS remote — native Ctrl+V reads the remote Mac's");
-        println!("clipboard (empty), so use the `clipaste-paste` helper instead.");
-    } else {
-        println!("  3a. Claude Code: press Ctrl+V (fetched via the xclip shim)");
-        println!("  3b. Codex CLI:  run `clipaste-paste` and paste the printed path");
-        println!();
-        println!("Note: Codex reads the clipboard in-process and bypasses the xclip");
-        println!("shim, so it can't paste images natively over SSH — use clipaste-paste.");
     }
 }
 
-// ─── WSL Setup ───
+fn setup_ssh(host: &str, port: Option<u16>) -> Result<(), String> {
+    validate_ssh_host(host)?;
+    if port == Some(0) {
+        return Err("SSH port must not be zero".into());
+    }
+    let token = security::load_token()
+        .map_err(|e| format!("cannot load local token: {e}; start the daemon first"))?;
+    let url = format!("http://127.0.0.1:{}", common::DEFAULT_PORT);
+    verify_auth(&url, &token)?;
+    // Read errors, malformed configs, and unsafe destinations fail before SSH.
+    let plan = prepare_ssh_config(&dirs_home()?, host, port)?;
+    let remote_os = install_shims_via_ssh(host, &url, port, &token)?;
+    apply_ssh_config(plan).map_err(|e| {
+        format!(
+            "remote helpers installed, but SSH config was NOT updated: {e}; fix it and rerun setup"
+        )
+    })?;
+    println!("Setup complete ({remote_os}). Open a NEW session: ssh {host}");
+    println!("Then run clipaste doctor; use clipaste-paste for an image path.");
+    println!("Authentication/transport failures never fall back to the native clipboard; an empty clipboard may.");
+    Ok(())
+}
 
-/// One address that might reach the Windows host, plus a human-readable reason.
-/// The reason is echoed on success and listed in the failure diagnostic, so the
-/// user can see *why* each address was tried.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HostCandidate {
     ip: String,
     source: &'static str,
 }
-
 const MIRRORED_LOOPBACK: &str = "mirrored-mode loopback";
 const RESOLV_NAMESERVER: &str = "/etc/resolv.conf nameserver";
 const DEFAULT_GATEWAY: &str = "default gateway";
 
-/// Build the ordered list of addresses to probe for the Windows-side daemon.
-///
-/// WSL2 has two networking modes and they need *different* addresses:
-///
-/// - **NAT** (default): WSL sits behind a virtual switch; the Windows host is
-///   the vEthernet gateway, which is normally also the `nameserver` line in
-///   `/etc/resolv.conf`. With `dnsTunneling=true` that nameserver becomes a
-///   virtual DNS endpoint (`10.255.255.254`) instead — hence the gateway
-///   candidate, read from the routing table rather than from DNS config.
-/// - **mirrored** (`networkingMode=mirrored`): WSL shares the host's network
-///   interfaces, so the host is reachable at `127.0.0.1` and the resolv.conf
-///   nameserver points at nothing that listens on our port.
-///
-/// This is issue #7: detection used to read resolv.conf and nothing else, so
-/// under mirrored networking it locked onto an unreachable address and aborted.
-/// The mode (when `wslinfo` can report it) only decides the *order* — every
-/// candidate is probed regardless, so an older WSL without `wslinfo` still lands
-/// on the right address.
 fn wsl_host_candidates(
     mode: Option<&str>,
     nameserver: Option<String>,
     gateway: Option<String>,
 ) -> Vec<HostCandidate> {
     let loopback = HostCandidate {
-        ip: "127.0.0.1".to_string(),
+        ip: "127.0.0.1".into(),
         source: MIRRORED_LOOPBACK,
     };
-    let mirrored = matches!(mode, Some(m) if m.eq_ignore_ascii_case("mirrored"));
-
-    let mut out: Vec<HostCandidate> = Vec::new();
+    let mirrored = mode.is_some_and(|m| m.eq_ignore_ascii_case("mirrored"));
+    let mut out = Vec::new();
     if mirrored {
         out.push(loopback.clone());
     }
     if let Some(ip) = nameserver {
-        out.push(HostCandidate { ip, source: RESOLV_NAMESERVER });
+        out.push(HostCandidate {
+            ip,
+            source: RESOLV_NAMESERVER,
+        });
     }
     if let Some(ip) = gateway {
-        out.push(HostCandidate { ip, source: DEFAULT_GATEWAY });
+        out.push(HostCandidate {
+            ip,
+            source: DEFAULT_GATEWAY,
+        });
     }
     if !mirrored {
         out.push(loopback);
     }
-
-    // Keep first occurrence: NAT usually reports the same IP for nameserver and
-    // gateway, and we want the earlier (more specific) reason attached to it.
     let mut seen = Vec::new();
     out.retain(|c| {
-        if seen.contains(&c.ip) {
+        if c.ip.parse::<IpAddr>().is_err() || seen.contains(&c.ip) {
             false
         } else {
             seen.push(c.ip.clone());
@@ -444,137 +450,113 @@ fn wsl_host_candidates(
     out
 }
 
-pub fn run_wsl(host_override: Option<String>) {
-    println!("clipaste wsl-setup");
-    println!();
+fn ip_base_url(host: &str) -> Result<String, String> {
+    let ip: IpAddr = host.parse().map_err(|_| {
+        "--host must be a literal IPv4 or IPv6 address (no URL, hostname, or userinfo)".to_string()
+    })?;
+    Ok(match ip {
+        IpAddr::V4(ip) => format!("http://{ip}:{}", common::DEFAULT_PORT),
+        IpAddr::V6(ip) => format!("http://[{ip}]:{}", common::DEFAULT_PORT),
+    })
+}
 
-    let port = common::DEFAULT_PORT;
-    let mode = wsl_networking_mode();
+fn validate_base_url(url: &str) -> Result<(), String> {
+    let authority = url
+        .strip_prefix("http://")
+        .and_then(|s| s.strip_suffix(&format!(":{}", common::DEFAULT_PORT)))
+        .ok_or("invalid helper URL")?;
+    let host = authority
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(authority);
+    if ip_base_url(host)? != url {
+        return Err("helper URL must contain a canonical literal IP address".into());
+    }
+    Ok(())
+}
 
-    // Step 1: Find an address where the Windows-side daemon actually answers.
-    // Detection and verification are one step: an address that doesn't serve
-    // /health is not a usable answer, so reporting it as "detected" would only
-    // push the failure downstream into a shim that silently never works.
-    print!("[1/2] Locating clipaste on the Windows host... ");
-    std::io::stdout().flush().unwrap();
+pub fn run_wsl(host: Option<String>, token_file: Option<&Path>) {
+    if let Err(e) = setup_wsl(host, token_file) {
+        eprintln!("clipaste wsl-setup: {e}");
+        std::process::exit(1);
+    }
+}
 
-    let win_ip = match host_override {
-        Some(ip) => {
-            if !check_health(&format!("http://{ip}:{port}")) {
-                println!("FAILED");
-                eprintln!("  --host {ip}: no clipaste server answering on port {port}");
-                eprintln!("  Check that clipaste.exe is running on Windows and that {ip} is right.");
-                std::process::exit(1);
-            }
-            println!("{ip} (--host)");
-            ip
+fn setup_wsl(host: Option<String>, token_file: Option<&Path>) -> Result<(), String> {
+    // Validate explicit input before even making a public discovery request.
+    let explicit_url = host.as_deref().map(ip_base_url).transpose()?;
+    let token = match token_file {
+        Some(path) => security::read_token(path),
+        None => security::load_token(),
+    }.map_err(|e| format!("cannot read token: {e}; first setup requires --token-file PATH containing the Windows daemon token"))?;
+    let url = if let Some(url) = explicit_url {
+        if !check_health(&url) {
+            return Err(format!("no authenticated-capable clipaste daemon at {url}"));
         }
-        None => {
-            let candidates = wsl_host_candidates(
-                mode.as_deref(),
-                read_resolv_nameserver(),
-                read_default_gateway(),
-            );
-            match candidates
-                .iter()
-                .find(|c| check_health(&format!("http://{}:{}", c.ip, port)))
-            {
-                Some(c) => {
-                    println!("{} ({})", c.ip, c.source);
-                    c.ip.clone()
-                }
-                None => {
-                    println!("FAILED");
-                    print_wsl_failure_help(&candidates, mode.as_deref());
-                    std::process::exit(1);
-                }
+        url
+    } else {
+        let mode = wsl_networking_mode();
+        let candidates = wsl_host_candidates(
+            mode.as_deref(),
+            read_resolv_nameserver(),
+            read_default_gateway(),
+        );
+        let found = candidates
+            .iter()
+            .filter_map(|c| ip_base_url(&c.ip).ok())
+            .find(|url| check_health(url));
+        match found {
+            Some(url) => url,
+            None => {
+                print_wsl_failure_help(&candidates, mode.as_deref());
+                return Err("no Windows clipaste daemon found; nothing installed".into());
             }
         }
     };
-
-    // Step 2: Install shims locally (we're inside WSL2)
-    let url = format!("http://{win_ip}:{port}");
-    print!("[2/2] Installing xclip/wl-paste shims + clipaste-paste... ");
-    std::io::stdout().flush().unwrap();
-    match install_shims_locally(&url) {
-        Ok(()) => println!("OK"),
-        Err(e) => {
-            println!("FAILED");
-            eprintln!("  {e}");
-            std::process::exit(1);
-        }
-    }
-
-    println!();
-    println!("Setup complete! Now:");
-    println!("  1. Open a new terminal (or run: source ~/.bashrc)");
-    println!("  2. Take a screenshot on Windows (Win+Shift+S)");
-    println!("  3a. Claude Code: press Ctrl+V (fetched via the xclip shim)");
-    println!("  3b. Codex CLI:  run `clipaste-paste` and paste the printed path");
-    println!();
-    println!("No SSH tunnel needed — WSL2 connects directly to the Windows host.");
+    verify_auth(&url, &token)?;
+    install_shims_locally(&url, &token)?;
+    println!("WSL helpers installed. Open a new terminal, then run clipaste doctor.");
+    println!("Use clipaste-paste for an image path. Managed downloads expire after one hour on the next helper download.");
+    Ok(())
 }
 
-/// Explain a failed probe honestly: what was tried, why each address, and the
-/// concrete ways out. In particular, clipaste binds to `127.0.0.1` on Windows,
-/// which NAT-mode WSL cannot reach at all — that deserves saying out loud
-/// rather than leaving the user to guess at a firewall.
 fn print_wsl_failure_help(candidates: &[HostCandidate], mode: Option<&str>) {
-    let port = common::DEFAULT_PORT;
-    eprintln!("  No clipaste server answered. Tried:");
+    eprintln!("No clipaste daemon answered. Tried:");
     for c in candidates {
-        eprintln!("    - http://{}:{port}/health  ({})", c.ip, c.source);
+        eprintln!("  {} ({})", c.ip, c.source);
     }
-    match mode {
-        Some(m) => eprintln!("  WSL networking mode: {m}"),
-        None => eprintln!("  WSL networking mode: unknown (`wslinfo` unavailable)"),
-    }
-    eprintln!();
-    eprintln!("  Checklist:");
-    eprintln!("    1. clipaste.exe must be running on the Windows side.");
-    eprintln!("    2. clipaste binds to 127.0.0.1 on Windows, which WSL can reach only in");
-    eprintln!("       mirrored networking mode. In the default NAT mode, add this to");
-    eprintln!("       %USERPROFILE%\\.wslconfig:");
-    eprintln!("         [wsl2]");
-    eprintln!("         networkingMode=mirrored");
-    eprintln!("       then run `wsl --shutdown` in PowerShell and reopen WSL.");
-    eprintln!("    3. If the server answers on some other address, pass it explicitly:");
-    eprintln!("         clipaste wsl-setup --host <ip>");
+    eprintln!("WSL networking mode: {}", mode.unwrap_or("unknown"));
+    eprintln!("Start clipaste.exe on Windows. NAT cannot reach its loopback listener; use mirrored networking in %USERPROFILE%\\.wslconfig, then wsl --shutdown.");
+    eprintln!(
+        "You may select a literal IP with --host; first setup also requires --token-file PATH."
+    );
 }
 
-// ─── Helpers ───
-
-fn check_health(base_url: &str) -> bool {
-    // Bounded timeouts matter here: wsl-setup probes several candidate addresses
-    // in sequence, and a firewall that DROPs (rather than rejects) would
-    // otherwise stall each probe on the TCP connect for minutes.
+fn check_health(url: &str) -> bool {
     let out = Command::new("curl")
         .args([
-            "-sf",
+            "-q",
+            "--noproxy",
+            "*",
             "--connect-timeout",
             "2",
-            "-m",
-            "5",
-            &format!("{base_url}/health"),
+            "--max-time",
+            "10",
+            "-fsS",
+            &format!("{url}/health"),
         ])
         .output();
-    match out {
-        Ok(o) if o.status.success() => is_clipaste_health_body(&String::from_utf8_lossy(&o.stdout)),
-        _ => false,
-    }
+    matches!(out, Ok(o) if o.status.success() && is_clipaste_health_body(&String::from_utf8_lossy(&o.stdout)))
 }
-
-/// Confirm the responder is clipaste, not just *something* on that port.
-/// Candidate probing can hit a LAN gateway or an unrelated local service, and
-/// pointing the shims at those would fetch garbage instead of a screenshot.
 fn is_clipaste_health_body(body: &str) -> bool {
-    body.replace(' ', "").contains("\"status\":\"ok\"")
+    let body: String = body.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    body.contains("\"status\":\"ok\"") && body.contains("\"auth\":\"bearer\"")
 }
-
-/// `wslinfo --networking-mode` prints `nat` or `mirrored`. It only exists on
-/// recent WSL builds, so absence is normal and simply leaves the order alone.
 fn wsl_networking_mode() -> Option<String> {
-    let out = Command::new("wslinfo").arg("--networking-mode").output().ok()?;
+    let out = Command::new("wslinfo")
+        .arg("--networking-mode")
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -585,36 +567,23 @@ fn wsl_networking_mode() -> Option<String> {
         Some(mode)
     }
 }
-
 fn read_resolv_nameserver() -> Option<String> {
-    let content = std::fs::read_to_string("/etc/resolv.conf").ok()?;
-    parse_resolv_nameserver(&content)
+    parse_resolv_nameserver(&std::fs::read_to_string("/etc/resolv.conf").ok()?)
 }
-
 fn parse_resolv_nameserver(content: &str) -> Option<String> {
     content.lines().find_map(|line| {
-        let line = line.trim();
-        if line.starts_with('#') || line.starts_with(';') {
+        let mut fields = line.split_whitespace();
+        if fields.next()? != "nameserver" {
             return None;
         }
-        let rest = line.strip_prefix("nameserver")?;
-        let ip = rest.trim();
-        // IPv6 nameservers can't be used as-is in our `http://{ip}:{port}` URLs,
-        // and WSL's host address is always IPv4 — skip them rather than emit a
-        // malformed URL.
-        if ip.is_empty() || ip.contains(':') {
-            None
-        } else {
-            Some(ip.split_whitespace().next()?.to_string())
-        }
+        Some(fields.next()?.parse::<IpAddr>().ok()?.to_string())
     })
 }
-
-/// The NAT-mode Windows host is the default gateway. Read it from `ip route`
-/// when iproute2 is present, else straight from `/proc/net/route` (WSL distros
-/// like Kali ship both, but minimal images may have neither `ip` nor `route`).
 fn read_default_gateway() -> Option<String> {
-    if let Ok(out) = Command::new("ip").args(["route", "show", "default"]).output() {
+    if let Ok(out) = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+    {
         if out.status.success() {
             if let Some(gw) = parse_ip_route_default(&String::from_utf8_lossy(&out.stdout)) {
                 return Some(gw);
@@ -623,522 +592,938 @@ fn read_default_gateway() -> Option<String> {
     }
     parse_proc_net_route(&std::fs::read_to_string("/proc/net/route").ok()?)
 }
-
-/// Parse `default via 172.29.128.1 dev eth0 ...` (first default route wins).
-fn parse_ip_route_default(output: &str) -> Option<String> {
-    output.lines().find_map(|line| {
-        let mut parts = line.split_whitespace();
-        if parts.next()? != "default" {
+fn parse_ip_route_default(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next()? != "default" {
             return None;
         }
-        let mut parts = parts.skip_while(|t| *t != "via");
-        parts.next()?; // consume "via"
-        let gw = parts.next()?;
-        if gw.contains(':') {
-            None
-        } else {
-            Some(gw.to_string())
-        }
+        let mut fields = fields.skip_while(|v| *v != "via");
+        fields.next()?;
+        Some(fields.next()?.parse::<IpAddr>().ok()?.to_string())
     })
 }
-
-/// Parse the default route out of `/proc/net/route`. Gateway addresses there are
-/// little-endian hex, e.g. `0180 1FAC` → 172.31.128.1.
 fn parse_proc_net_route(content: &str) -> Option<String> {
     content.lines().skip(1).find_map(|line| {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() < 3 || f[1] != "00000000" {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 3 || fields[1] != "00000000" {
             return None;
         }
-        hex_le_to_ipv4(f[2])
+        let n = u32::from_str_radix(fields[2], 16).ok()?;
+        if n == 0 {
+            return None;
+        }
+        Some(std::net::Ipv4Addr::from(n.to_le_bytes()).to_string())
     })
 }
 
-fn hex_le_to_ipv4(hex: &str) -> Option<String> {
-    let n = u32::from_str_radix(hex, 16).ok()?;
-    if n == 0 {
-        return None;
+// Only our delimited blocks are parsed. Arbitrary Host/Match/Include syntax and
+// bytes are left alone; a Host * line restores context before the original.
+fn validate_ssh_host(host: &str) -> Result<&str, String> {
+    let mut pieces = host.split('@');
+    let first = pieces.next().unwrap_or("");
+    let second = pieces.next();
+    if pieces.next().is_some() {
+        return Err("invalid SSH target".into());
     }
-    Some(format!(
-        "{}.{}.{}.{}",
-        n & 0xff,
-        (n >> 8) & 0xff,
-        (n >> 16) & 0xff,
-        (n >> 24) & 0xff
-    ))
-}
-
-fn add_remote_forward(host: &str, ssh_port: Option<u16>) -> Result<String, String> {
-    let ssh_config_path = dirs_home().join(".ssh/config");
-    let ssh_dir = ssh_config_path.parent().unwrap();
-    if !ssh_dir.exists() {
-        std::fs::create_dir_all(ssh_dir)
-            .map_err(|e| format!("Cannot create ~/.ssh: {e}"))?;
-    }
-    let config_content = std::fs::read_to_string(&ssh_config_path).unwrap_or_default();
-    let host_pattern = extract_hostname(host);
-
-    match build_ssh_config(&config_content, &host_pattern, ssh_port) {
-        (None, msg) => Ok(msg),
-        (Some(new_config), msg) => {
-            std::fs::write(&ssh_config_path, &new_config)
-                .map_err(|e| format!("Cannot write ~/.ssh/config: {e}"))?;
-            Ok(msg)
-        }
-    }
-}
-
-/// Pure transformation: given the existing `~/.ssh/config` text, inject a
-/// `RemoteForward` (and a `Port` when a custom SSH port is given) into the block
-/// matching `host_pattern`. Returns `(None, msg)` when nothing needs changing
-/// ("already configured"), or `(Some(new_config), msg)` with the rewritten file.
-///
-/// `RemoteForward` is the idempotency key. A `Port` directive already present in
-/// the matching block is left untouched (we never override the user's port).
-fn build_ssh_config(
-    existing: &str,
-    host_pattern: &str,
-    ssh_port: Option<u16>,
-) -> (Option<String>, String) {
-    let port = common::DEFAULT_PORT;
-    let forward_line = format!("RemoteForward {port} 127.0.0.1:{port}");
-
-    let lines: Vec<&str> = existing.lines().collect();
-    let mut inject_after: Option<usize> = None;
-    let mut in_matching_block = false;
-    let mut found_existing_forward = false;
-    let mut found_existing_port = false;
-
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-
-        // New Host block starts — reset per-block matching state.
-        // Note: found_existing_* is latching (never reset), so a directive
-        // found in an earlier matching block survives later blocks.
-        if trimmed.starts_with("Host ") {
-            in_matching_block = false;
-
-            let host_value = trimmed.strip_prefix("Host ").unwrap_or("").trim();
-            // Skip wildcard-only blocks (Host *)
-            if host_value.split_whitespace().all(|h| h.contains('*') || h.contains('?')) {
-                continue;
-            }
-            if host_value.split_whitespace().any(|h| h == host_pattern) {
-                in_matching_block = true;
-                // Fallback: inject after Host line if block has no HostName
-                if inject_after.is_none() {
-                    inject_after = Some(i);
-                }
-            }
-        }
-
-        // HostName in current block — prefer injecting after this line
-        if trimmed.starts_with("HostName ") || trimmed.starts_with("HostName\t") {
-            let hostname_value = trimmed.strip_prefix("HostName").unwrap_or("").trim();
-            if hostname_value == host_pattern {
-                in_matching_block = true;
-            }
-            if in_matching_block {
-                // Override: prefer injecting after HostName over Host line
-                inject_after = Some(i);
-            }
-        }
-
-        // Check if any matching block already has the forward / port (latching)
-        if in_matching_block && trimmed.contains(&forward_line) {
-            found_existing_forward = true;
-        }
-        if in_matching_block
-            && (trimmed.starts_with("Port ") || trimmed.starts_with("Port\t"))
-        {
-            found_existing_port = true;
-        }
-    }
-
-    // Lines to inject after the chosen anchor (preserve a stable order).
-    let mut inject_lines: Vec<String> = Vec::new();
-    if !found_existing_forward {
-        inject_lines.push(forward_line.clone());
-    }
-    if let Some(p) = ssh_port {
-        if !found_existing_port {
-            inject_lines.push(format!("Port {p}"));
-        }
-    }
-
-    if inject_lines.is_empty() {
-        return (None, "already configured".to_string());
-    }
-
-    let mut new_config = String::new();
-    for (i, line) in lines.iter().enumerate() {
-        new_config.push_str(line);
-        new_config.push('\n');
-        if Some(i) == inject_after {
-            for l in &inject_lines {
-                new_config.push_str(&format!("    {l}\n"));
-            }
-        }
-    }
-
-    if inject_after.is_none() {
-        new_config.push_str(&format!(
-            "\n# clipaste remote paste\nHost clipaste-{host_pattern}\n    HostName {host_pattern}\n"
-        ));
-        if let Some(p) = ssh_port {
-            new_config.push_str(&format!("    Port {p}\n"));
-        }
-        new_config.push_str(&format!("    {forward_line}\n"));
-    }
-
-    let msg = if ssh_port.is_some() && !found_existing_port {
-        "OK (added RemoteForward + Port)".to_string()
-    } else {
-        "OK (added RemoteForward)".to_string()
+    let hostname = second.unwrap_or(first);
+    let valid = |s: &str| {
+        !s.is_empty()
+            && !s.starts_with('-')
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
     };
-    (Some(new_config), msg)
-}
-
-fn dirs_home() -> std::path::PathBuf {
-    // HOME is set on Unix/macOS; USERPROFILE is the Windows equivalent
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
-}
-
-fn extract_hostname(host: &str) -> String {
-    if let Some(at) = host.rfind('@') {
-        host[at + 1..].to_string()
-    } else {
-        host.to_string()
+    if !valid(first) || !valid(hostname) {
+        return Err("SSH target must be [user@]literal-host using only letters, digits, dots, underscores, and hyphens".into());
     }
+    Ok(hostname)
+}
+
+fn managed_block(host: &str, port: Option<u16>) -> String {
+    let mut block = format!("# BEGIN clipaste {host}\nHost {host}\n    RemoteForward 127.0.0.1:{0} 127.0.0.1:{0}\n    ExitOnForwardFailure yes\n", common::DEFAULT_PORT);
+    if let Some(port) = port {
+        block.push_str(&format!("    Port {port}\n"));
+    }
+    block.push_str(&format!("# END clipaste {host}\nHost *\n"));
+    block
+}
+
+fn remove_managed_blocks(existing: &str, target: Option<&str>) -> Result<String, String> {
+    let mut out = String::new();
+    let mut rest = existing;
+    while !rest.is_empty() {
+        let end = rest.find('\n').map(|n| n + 1).unwrap_or(rest.len());
+        let line = &rest[..end];
+        if let Some(host) = line
+            .strip_prefix("# BEGIN clipaste ")
+            .and_then(|s| s.strip_suffix('\n'))
+        {
+            validate_ssh_host(host)?;
+            if host.contains('@') {
+                return Err("invalid managed Host block".into());
+            }
+            let marker = format!("# END clipaste {host}\nHost *\n");
+            let n = rest
+                .find(&marker)
+                .ok_or("unterminated clipaste managed block")?
+                + marker.len();
+            let block = &rest[..n];
+            let port = block.lines().find_map(|l| {
+                l.strip_prefix("    Port ")
+                    .and_then(|p| p.parse::<u16>().ok())
+            });
+            if block != managed_block(host, port) {
+                return Err("modified clipaste managed block; resolve it manually".into());
+            }
+            if target.is_some_and(|t| t != host) {
+                out.push_str(block);
+            }
+            rest = &rest[n..];
+        } else {
+            out.push_str(line);
+            rest = &rest[end..];
+        }
+    }
+    Ok(out)
+}
+
+fn build_ssh_config(existing: &str, hostname: &str, port: Option<u16>) -> Result<String, String> {
+    validate_ssh_host(hostname)?;
+    if hostname.contains('@') || port == Some(0) {
+        return Err("invalid SSH host pattern or port".into());
+    }
+    // Conservative, context-free conflict detection: never guess which Host or
+    // Match a preexisting forwarding directive applies to. Includes stay intact;
+    // ExitOnForwardFailure prevents a hidden included conflict being silent.
+    let unmanaged = remove_managed_blocks(existing, None)?;
+    for line in unmanaged.lines() {
+        let line = line.trim_start();
+        if line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line
+            .split(|c: char| c.is_ascii_whitespace() || c == '=')
+            .filter(|s| !s.is_empty());
+        if fields
+            .next()
+            .is_some_and(|s| s.eq_ignore_ascii_case("RemoteForward"))
+        {
+            let listen = fields.next().ok_or("malformed unmanaged RemoteForward")?;
+            if listen.trim_matches('"').rsplit(':').next()
+                == Some(&common::DEFAULT_PORT.to_string())
+            {
+                return Err(
+                    "unmanaged RemoteForward uses clipaste's port; remove/resolve it before setup"
+                        .into(),
+                );
+            }
+        }
+    }
+    let remaining = remove_managed_blocks(existing, Some(hostname))?;
+    Ok(format!("{}{remaining}", managed_block(hostname, port)))
+}
+
+struct ConfigPlan {
+    path: PathBuf,
+    original: Option<Vec<u8>>,
+    updated: Vec<u8>,
+}
+
+fn dirs_home() -> Result<PathBuf, String> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .ok_or("HOME/USERPROFILE must be an absolute path".into())
+}
+
+fn check_directory_chain(path: &Path) -> Result<(), String> {
+    for p in path.ancestors() {
+        match std::fs::symlink_metadata(p) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(format!("unsafe directory: {}", p.display()))
+            }
+            Ok(meta) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
+                        return Err(format!("unsafe writable directory: {}", p.display()));
+                    }
+                }
+                #[cfg(not(unix))]
+                let _ = meta;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(format!("inspect {}: {e}", p.display())),
+        }
+    }
+    Ok(())
+}
+
+fn read_owned_file(path: &Path, private: bool) -> Result<Option<Vec<u8>>, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("inspect {}: {e}", path.display())),
+    };
+    validate_file_metadata(path, &metadata, private)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let opened = file
+        .metadata()
+        .map_err(|e| format!("inspect open {}: {e}", path.display()))?;
+    validate_file_metadata(path, &opened, private)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(Some(bytes))
+}
+
+fn validate_file_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    private: bool,
+) -> Result<(), String> {
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(format!("refusing nonregular file: {}", path.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o022 != 0
+            || (private && metadata.mode() & 0o777 != 0o600)
+        {
+            return Err(format!(
+                "unsafe ownership, links, or permissions: {}",
+                path.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    Ok(())
+}
+
+fn backup_path(config: &Path) -> PathBuf {
+    config.with_file_name("config.clipaste.bak")
+}
+
+fn prepare_ssh_config(home: &Path, host: &str, port: Option<u16>) -> Result<ConfigPlan, String> {
+    let hostname = validate_ssh_host(host)?;
+    let directory = home.join(".ssh");
+    check_directory_chain(&directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let parent = if directory.exists() { &directory } else { home };
+        let meta =
+            std::fs::metadata(parent).map_err(|e| format!("inspect {}: {e}", parent.display()))?;
+        if meta.uid() != unsafe { libc::geteuid() }
+            || meta.mode() & 0o022 != 0
+            || meta.mode() & 0o300 != 0o300
+        {
+            return Err("SSH config parent must be owned by you, writable/searchable, and not writable by others".into());
+        }
+    }
+    let path = directory.join("config");
+    let original = read_owned_file(&path, false)?;
+    let text = std::str::from_utf8(original.as_deref().unwrap_or(b""))
+        .map_err(|_| "SSH config is not UTF-8; refusing to rewrite it")?;
+    let updated = build_ssh_config(text, hostname, port)?.into_bytes();
+    // Refuse an unsafe backup *before* deploying anything remotely.
+    read_owned_file(&backup_path(&path), true)?;
+    Ok(ConfigPlan {
+        path,
+        original,
+        updated,
+    })
+}
+
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+fn atomic_private_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|e| format!("temporary file randomness: {e}"))?;
+    let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    let stage = path.with_file_name(format!(".clipaste-config-{suffix}"));
+    let mut created = false;
+    let result = (|| {
+        let mut file = create_private(&stage)?;
+        created = true;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&stage, path)
+    })();
+    if result.is_err() && created {
+        let _ = std::fs::remove_file(&stage);
+    }
+    result.map_err(|e| format!("atomic write {}: {e}", path.display()))
+}
+
+fn apply_ssh_config(plan: ConfigPlan) -> Result<(), String> {
+    check_directory_chain(plan.path.parent().ok_or("missing config parent")?)?;
+    if read_owned_file(&plan.path, false)? != plan.original {
+        return Err(
+            "SSH config changed during setup; refusing to overwrite concurrent edits".into(),
+        );
+    }
+    if plan.original.as_deref() == Some(plan.updated.as_slice()) {
+        return Ok(());
+    }
+    let directory = plan.path.parent().ok_or("missing config parent")?;
+    if !directory.exists() {
+        #[allow(unused_mut)]
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(directory)
+            .map_err(|e| format!("create ~/.ssh: {e}"))?;
+    }
+    let backup = backup_path(&plan.path);
+    if let Some(original) = plan.original {
+        if read_owned_file(&backup, true)?.is_none() {
+            let mut file =
+                create_private(&backup).map_err(|e| format!("create config backup: {e}"))?;
+            if let Err(e) = file.write_all(&original).and_then(|_| file.sync_all()) {
+                drop(file);
+                let _ = std::fs::remove_file(&backup);
+                return Err(format!("write config backup (config unchanged): {e}"));
+            }
+        }
+    }
+    atomic_private_write(&plan.path, &plan.updated)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn extract_hostname_strips_user() {
-        assert_eq!(extract_hostname("user@host"), "host");
-        assert_eq!(extract_hostname("host"), "host");
-        assert_eq!(extract_hostname("a@b@host"), "host");
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const URL: &str = "http://127.0.0.1:18340";
+    #[cfg(unix)]
+    struct TempHome(PathBuf);
+    #[cfg(unix)]
+    impl TempHome {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
+                "clipaste-setup-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            Self(path)
+        }
+        fn command(&self) -> Command {
+            let mut command = Command::new("/bin/bash");
+            command
+                .env_clear()
+                .env("HOME", &self.0)
+                .env("SHELL", "/bin/zsh")
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+            command
+        }
+        fn run(&self, script: &str) -> std::process::Output {
+            let mut command = self.command();
+            command.arg("-s");
+            shell_output(command, script)
+        }
     }
-
-    #[test]
-    fn ssh_port_args_shape() {
-        assert!(ssh_port_args(None).is_empty());
-        assert_eq!(ssh_port_args(Some(2200)), vec!["-p", "2200"]);
+    #[cfg(unix)]
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
-
-    #[test]
-    fn new_block_when_no_match() {
-        let (out, msg) = build_ssh_config("", "host", None);
-        let out = out.unwrap();
-        assert!(out.contains("Host clipaste-host"));
-        assert!(out.contains("HostName host"));
-        assert!(out.contains("RemoteForward 18340 127.0.0.1:18340"));
-        assert!(!out.contains("Port "));
-        assert_eq!(msg, "OK (added RemoteForward)");
+    #[cfg(unix)]
+    fn shell_output(mut command: Command, script: &str) -> std::process::Output {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
     }
-
-    #[test]
-    fn new_block_with_custom_port() {
-        let (out, msg) = build_ssh_config("", "host", Some(22222));
-        let out = out.unwrap();
-        assert!(out.contains("Host clipaste-host"));
-        assert!(out.contains("    Port 22222\n"));
-        assert!(out.contains("RemoteForward 18340 127.0.0.1:18340"));
-        assert_eq!(msg, "OK (added RemoteForward + Port)");
-    }
-
-    #[test]
-    fn injects_into_existing_block_after_hostname() {
-        let existing = "Host myserver\n    HostName 10.0.0.1\n    User me\n";
-        let (out, msg) = build_ssh_config(existing, "myserver", Some(22222));
-        let out = out.unwrap();
-        // Injected right after HostName, before User
-        let hn = out.find("HostName 10.0.0.1").unwrap();
-        let fwd = out.find("RemoteForward").unwrap();
-        let port = out.find("Port 22222").unwrap();
-        let user = out.find("User me").unwrap();
-        assert!(hn < fwd && fwd < user);
-        assert!(hn < port && port < user);
-        assert_eq!(msg, "OK (added RemoteForward + Port)");
-    }
-
-    #[test]
-    fn idempotent_when_forward_present_no_port_requested() {
-        let existing =
-            "Host h\n    HostName h\n    RemoteForward 18340 127.0.0.1:18340\n";
-        let (out, msg) = build_ssh_config(existing, "h", None);
-        assert!(out.is_none());
-        assert_eq!(msg, "already configured");
-    }
-
-    #[test]
-    fn does_not_duplicate_existing_user_port() {
-        // Block already has a Port (the user's real SSH port) and the forward.
-        let existing =
-            "Host h\n    HostName h\n    Port 2222\n    RemoteForward 18340 127.0.0.1:18340\n";
-        let (out, msg) = build_ssh_config(existing, "h", Some(2222));
-        assert!(out.is_none(), "nothing to add → already configured");
-        assert_eq!(msg, "already configured");
-    }
-
-    #[test]
-    fn adds_only_port_when_forward_already_present() {
-        let existing =
-            "Host h\n    HostName h\n    RemoteForward 18340 127.0.0.1:18340\n";
-        let (out, msg) = build_ssh_config(existing, "h", Some(2222));
-        let out = out.unwrap();
-        assert!(out.contains("Port 2222"));
-        assert_eq!(out.matches("RemoteForward 18340").count(), 1);
-        assert_eq!(msg, "OK (added RemoteForward + Port)");
-    }
-
-    #[test]
-    fn skips_wildcard_block() {
-        let existing = "Host *\n    ForwardAgent yes\n";
-        let (out, _) = build_ssh_config(existing, "host", None);
-        let out = out.unwrap();
-        // A dedicated clipaste block is created instead of injecting into Host *
-        assert!(out.contains("Host clipaste-host"));
-    }
-
-    // ─── WSL host detection (issue #7) ───
-
-    fn ips(c: &[HostCandidate]) -> Vec<&str> {
-        c.iter().map(|c| c.ip.as_str()).collect()
-    }
-
-    #[test]
-    fn nat_mode_prefers_nameserver_then_gateway() {
-        let c = wsl_host_candidates(
-            Some("nat"),
-            Some("172.29.128.1".into()),
-            Some("172.29.128.1".into()),
+    #[cfg(unix)]
+    fn success(output: std::process::Output) {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
-        // nameserver == gateway in plain NAT → deduped, loopback still probed last
-        assert_eq!(ips(&c), vec!["172.29.128.1", "127.0.0.1"]);
-        assert_eq!(c[0].source, RESOLV_NAMESERVER);
     }
-
     #[test]
-    fn nat_with_dns_tunneling_falls_back_to_gateway() {
-        // dnsTunneling=true makes the nameserver a virtual endpoint, not the host
-        let c = wsl_host_candidates(
-            Some("nat"),
-            Some("10.255.255.254".into()),
-            Some("172.29.128.1".into()),
+    fn first_use_keeps_target_and_original_bytes() {
+        let original = "# RemoteForward 18340 127.0.0.1:18340\r\nHOST\tprod\n\tUser me\nMatch host prod\n\tCompression yes\nInclude ~/.ssh/config.d/*\nHost *\n Port 22";
+        let hostname = validate_ssh_host("alice@prod").unwrap();
+        let updated = build_ssh_config(original, hostname, Some(2222)).unwrap();
+        assert!(updated.starts_with("# BEGIN clipaste prod\nHost prod\n"));
+        assert!(updated.ends_with(original));
+        assert!(!updated.contains("Host clipaste-"));
+        assert!(updated.contains("ExitOnForwardFailure yes\n    Port 2222\n"));
+        assert_eq!(
+            build_ssh_config(&updated, hostname, Some(2222)).unwrap(),
+            updated
         );
-        assert_eq!(ips(&c), vec!["10.255.255.254", "172.29.128.1", "127.0.0.1"]);
     }
-
     #[test]
-    fn mirrored_mode_probes_loopback_first() {
-        // The issue #7 case: resolv.conf points at 10.255.255.254, host is loopback
-        let c = wsl_host_candidates(
+    fn managed_update_keeps_other_blocks() {
+        let a = build_ssh_config("Host *\n User me\n", "one", None).unwrap();
+        let b = build_ssh_config(&a, "two", None).unwrap();
+        let c = build_ssh_config(&b, "one", Some(2222)).unwrap();
+        assert!(c.contains(&managed_block("two", None)));
+        assert_eq!(c.matches("# BEGIN clipaste one\n").count(), 1);
+        assert!(build_ssh_config(
+            "Host prod\n REMOTEFORWARD\t127.0.0.1:18340 localhost:18340\n",
+            "prod",
+            None
+        )
+        .is_err());
+        assert!(build_ssh_config("# BEGIN clipaste prod\nHost evil\n", "prod", None).is_err());
+    }
+    #[test]
+    fn reject_config_and_shell_injection() {
+        for host in [
+            "-oProxyCommand=bad",
+            "a\nb",
+            "a b",
+            "*@host",
+            "a@b@host",
+            "a!b",
+            "[host]",
+            "a;bad",
+            "a#b",
+            "a\\b",
+            "a%h",
+            "",
+        ] {
+            assert!(validate_ssh_host(host).is_err(), "{host:?}");
+        }
+        for host in [
+            "127.0.0.1;touch /tmp/bad",
+            "localhost",
+            "user@127.0.0.1",
+            "127.0.0.1/path",
+            "[::1]",
+            "127.0.0.1\n",
+        ] {
+            assert!(ip_base_url(host).is_err());
+        }
+        assert_eq!(ip_base_url("::1").unwrap(), "http://[::1]:18340");
+        assert!(build_remote_setup_script("http://evil:18340", TOKEN).is_err());
+        assert!(build_remote_setup_script(URL, "bad").is_err());
+        assert_eq!(ssh_port_args(Some(2222)), ["-p", "2222"]);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn generated_scripts_parse() {
+        let home = TempHome::new();
+        for script in [
+            build_remote_setup_script(URL, TOKEN).unwrap(),
+            helper_script("xclip", URL),
+            helper_script("wl-paste", URL),
+            helper_script("clipaste-paste", URL),
+        ] {
+            let mut command = home.command();
+            command.arg("-n");
+            success(shell_output(command, &script));
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn installer_is_private_idempotent_and_secret_free() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempHome::new();
+        let script = build_remote_setup_script(URL, TOKEN).unwrap();
+        success(home.run(&script));
+        let helper = home.0.join(".local/bin/clipaste-paste");
+        assert_eq!(
+            std::fs::metadata(&helper).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(!std::fs::read_to_string(helper).unwrap().contains(TOKEN));
+        for path in [".config/clipaste", ".config/clipaste/token"] {
+            let mode = std::fs::metadata(home.0.join(path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode,
+                if path.ends_with("token") {
+                    0o600
+                } else {
+                    0o700
+                }
+            );
+        }
+        success(home.run(&script));
+        let rc = std::fs::read_to_string(home.0.join(".zshrc")).unwrap();
+        assert_eq!(rc.matches("# clipaste PATH").count(), 1);
+        assert_eq!(
+            std::fs::read_dir(home.0.join(".local/bin"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with(".clipaste-"))
+                .count(),
+            0
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn installer_prepends_path_when_bin_is_last_but_not_when_already_first() {
+        for already_first in [false, true] {
+            let home = TempHome::new();
+            let bin = home.0.join(".local/bin").display().to_string();
+            let path = if already_first {
+                format!("{bin}:/usr/bin:/bin")
+            } else {
+                format!("/usr/bin:/bin:{bin}")
+            };
+            let mut command = home.command();
+            command.env("PATH", &path);
+            let script = build_remote_setup_script(URL, TOKEN).unwrap();
+            success(shell_output(command, &script));
+            let rc = home.0.join(".zshrc");
+            if already_first {
+                assert!(
+                    !rc.exists(),
+                    "PATH already starts with the managed bin; no rc change needed"
+                );
+            } else {
+                let content = std::fs::read_to_string(&rc).unwrap();
+                assert!(content.contains("export PATH=\"$HOME/.local/bin:$PATH\""));
+                let mut command = home.command();
+                command.env("PATH", path);
+                success(shell_output(command, &script));
+                assert_eq!(std::fs::read_to_string(rc).unwrap(), content);
+            }
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn installer_refuses_unknown_and_symlink_before_writes() {
+        use std::os::unix::fs::symlink;
+        for link in [false, true] {
+            let home = TempHome::new();
+            std::fs::create_dir_all(home.0.join(".local/bin")).unwrap();
+            let target = home.0.join("foreign");
+            std::fs::write(&target, "#!/bin/bash\n# random clipaste comment\n").unwrap();
+            let helper = home.0.join(".local/bin/clipaste-paste");
+            if link {
+                symlink(&target, &helper).unwrap();
+            } else {
+                std::fs::copy(&target, &helper).unwrap();
+            }
+            assert!(!home
+                .run(&build_remote_setup_script(URL, TOKEN).unwrap())
+                .status
+                .success());
+            assert!(!home.0.join(".config/clipaste/token").exists());
+            assert!(!home.0.join(".zshrc").exists());
+            assert_eq!(
+                std::fs::read_to_string(target).unwrap(),
+                "#!/bin/bash\n# random clipaste comment\n"
+            );
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn ssh_config_backup_idempotence_and_invalid_utf8() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let home = TempHome::new();
+        std::fs::create_dir(home.0.join(".ssh")).unwrap();
+        let path = home.0.join(".ssh/config");
+        let original = b"HOST\tprod\n User alice\nMatch all\nInclude config.d/*\n";
+        std::fs::write(&path, original).unwrap();
+        apply_ssh_config(prepare_ssh_config(&home.0, "alice@prod", None).unwrap()).unwrap();
+        let first = std::fs::read(&path).unwrap();
+        assert_eq!(std::fs::read(backup_path(&path)).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(backup_path(&path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        apply_ssh_config(prepare_ssh_config(&home.0, "alice@prod", None).unwrap()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(prepare_ssh_config(&home.0, "prod", None).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), [0xff, 0xfe]);
+        std::fs::remove_file(&path).unwrap();
+        symlink(home.0.join("missing"), &path).unwrap();
+        assert!(prepare_ssh_config(&home.0, "prod", None).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_nonregular_and_concurrent_config_are_not_overwritten() {
+        let home = TempHome::new();
+        std::fs::create_dir(home.0.join(".ssh")).unwrap();
+        let path = home.0.join(".ssh/config");
+        std::fs::create_dir(&path).unwrap();
+        assert!(prepare_ssh_config(&home.0, "prod", None).is_err());
+        std::fs::remove_dir(&path).unwrap();
+        let plan = prepare_ssh_config(&home.0, "prod", None).unwrap();
+        std::fs::write(&path, "concurrent edit").unwrap();
+        assert!(apply_ssh_config(plan).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "concurrent edit");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn permission_errors_and_backup_symlinks_are_not_ignored() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let home = TempHome::new();
+        let directory = home.0.join(".ssh");
+        let path = directory.join("config");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&path, "Host prod\n User me\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(prepare_ssh_config(&home.0, "prod", None).is_err());
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(prepare_ssh_config(&home.0, "prod", None).is_err());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(home.0.join("unrelated"), backup_path(&path)).unwrap();
+        assert!(prepare_ssh_config(&home.0, "prod", None).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "Host prod\n User me\n"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn native_fallback_path_last_preserves_arguments_and_does_not_recurse() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempHome::new();
+        std::fs::create_dir_all(home.0.join(".local/bin")).unwrap();
+        std::fs::create_dir(home.0.join("native")).unwrap();
+        for tool in ["xclip", "wl-paste"] {
+            let shim = home.0.join(".local/bin").join(tool);
+            let real = home.0.join("native").join(tool);
+            std::fs::write(&shim, helper_script(tool, URL)).unwrap();
+            std::fs::write(&real, "#!/bin/bash\nprintf '<%s>\\n' \"$@\"\n").unwrap();
+            for path in [&shim, &real] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            for position in [0, 1, 2] {
+                let bin = home.0.join(".local/bin").display().to_string();
+                let native = home.0.join("native").display().to_string();
+                let mut parts = vec![native, "/usr/bin:/bin".into()];
+                parts.insert(position, bin);
+                let out = home
+                    .command()
+                    .arg(&shim)
+                    .args(["argument with spaces", "*", ""])
+                    .env("PATH", parts.join(":"))
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&out.stdout),
+                    "<argument with spaces>\n<*>\n<>\n"
+                );
+            }
+            let out = home
+                .command()
+                .arg(&shim)
+                .arg("native-only")
+                .env("PATH", home.0.join(".local/bin"))
+                .output()
+                .unwrap();
+            assert!(!out.status.success());
+        }
+    }
+    #[cfg(unix)]
+    fn fake_curl(home: &TempHome) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = home.0.join("fake-tools");
+        std::fs::create_dir(&dir).unwrap();
+        let curl = dir.join("curl");
+        std::fs::write(
+            &curl,
+            r#"#!/bin/bash
+printf '<%s>\n' "$@" > "$HOME/curl-argv"
+cat > "$HOME/curl-stdin"
+output=''
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o) output="$2"; shift ;;
+        */clipboard/type)
+            case "${FAKE_TYPE:-image}" in
+                fail) exit 22 ;;
+                empty) printf '{"type":"empty"}' ;;
+                malformed) printf 'bad response' ;;
+                *) printf '{"type":"image","format":"png"}' ;;
+            esac
+            exit 0 ;;
+        */clipboard/image)
+            [ "${FAKE_IMAGE:-ok}" = ok ] || exit 22
+            printf 'dummy PNG' > "$output"
+            exit 0 ;;
+    esac
+    shift
+done
+exit 99
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(curl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_helpers_fail_closed_and_expire_only_managed_downloads() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let home = TempHome::new();
+        success(home.run(&build_remote_setup_script(URL, TOKEN).unwrap()));
+        let fake = fake_curl(&home);
+        let helper = home.0.join(".local/bin/clipaste-paste");
+        let fake_path = format!("{}:/usr/bin:/bin", fake.display());
+        let output = home
+            .command()
+            .arg(&helper)
+            .env("PATH", &fake_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let image = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+        let cache = image.parent().unwrap();
+        assert_eq!(
+            std::fs::metadata(&image).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(cache).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let unrelated = cache.join("keep.png");
+        std::fs::write(&unrelated, "keep").unwrap();
+        let nested = cache.join("unrelated-directory");
+        std::fs::create_dir(&nested).unwrap();
+        let nested_file = nested.join("clipaste-image.old.png");
+        std::fs::write(&nested_file, "keep nested content").unwrap();
+        std::fs::set_permissions(&nested_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = cache.join("clipaste-image.link.png");
+        symlink(&unrelated, &link).unwrap();
+        success(
+            Command::new("touch")
+                .args(["-t", "200001010000"])
+                .arg(&image)
+                .arg(&unrelated)
+                .arg(&nested_file)
+                .output()
+                .unwrap(),
+        );
+        let output = home
+            .command()
+            .arg(&helper)
+            .env("PATH", &fake_path)
+            .output()
+            .unwrap();
+        success(output);
+        assert!(!image.exists());
+        assert!(unrelated.exists());
+        assert!(
+            nested_file.exists(),
+            "expiry must not descend into unrelated directories"
+        );
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let argv = std::fs::read_to_string(home.0.join("curl-argv")).unwrap();
+        assert!(argv.starts_with("<-q>\n<--config>\n<->\n"));
+        assert!(argv.contains("<--noproxy>\n<*>\n"));
+        assert!(argv.contains("<--connect-timeout>\n<2>\n<--max-time>\n<10>\n"));
+        assert!(!argv.contains(TOKEN));
+        assert_eq!(
+            std::fs::read_to_string(home.0.join("curl-stdin")).unwrap(),
+            format!("header = \"Authorization: Bearer {TOKEN}\"\n")
+        );
+        let count = std::fs::read_dir(cache).unwrap().count();
+        let output = home
+            .command()
+            .arg(&helper)
+            .env("PATH", &fake_path)
+            .env("FAKE_IMAGE", "fail")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(
+            std::fs::read_dir(cache).unwrap().count(),
+            count,
+            "failed download leaked a temp file"
+        );
+        for tool in ["xclip", "wl-paste"] {
+            let shim = home.0.join(".local/bin").join(tool);
+            // Darwin only installs the generic helper, so stage shims explicitly.
+            std::fs::write(&shim, helper_script(tool, URL)).unwrap();
+            let native = fake.join(tool);
+            std::fs::write(&native, "#!/bin/bash\nprintf 'native fallback'\n").unwrap();
+            std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let args = if tool == "xclip" {
+                vec!["-selection", "clipboard", "-t", "TARGETS", "-o"]
+            } else {
+                vec!["--list-types"]
+            };
+            for kind in ["fail", "malformed", "empty"] {
+                let out = home
+                    .command()
+                    .arg(&shim)
+                    .args(&args)
+                    .env("PATH", &fake_path)
+                    .env("FAKE_TYPE", kind)
+                    .output()
+                    .unwrap();
+                assert_eq!(out.status.success(), kind == "empty");
+                assert_eq!(
+                    String::from_utf8_lossy(&out.stdout),
+                    if kind == "empty" {
+                        "native fallback"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        std::fs::remove_file(home.0.join("curl-argv")).unwrap();
+        std::fs::write(home.0.join(".config/clipaste/token"), "invalid").unwrap();
+        let out = home
+            .command()
+            .arg(&helper)
+            .env("PATH", &fake_path)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(
+            !home.0.join("curl-argv").exists(),
+            "invalid token reached curl"
+        );
+        assert!(!home
+            .run(&build_remote_setup_script(URL, TOKEN).unwrap())
+            .status
+            .success());
+        assert_eq!(
+            std::fs::read_to_string(home.0.join(".config/clipaste/token")).unwrap(),
+            "invalid"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn installer_refuses_rc_links_and_cleans_failure_staging() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let home = TempHome::new();
+        let foreign = home.0.join("foreign");
+        std::fs::write(&foreign, "keep").unwrap();
+        symlink(&foreign, home.0.join(".zshrc")).unwrap();
+        let script = build_remote_setup_script(URL, TOKEN).unwrap();
+        assert!(!home.run(&script).status.success());
+        assert!(!home.0.join(".local").exists());
+        assert_eq!(std::fs::read_to_string(&foreign).unwrap(), "keep");
+        std::fs::remove_file(home.0.join(".zshrc")).unwrap();
+        let fake = home.0.join("fake-tools");
+        std::fs::create_dir(&fake).unwrap();
+        std::fs::write(fake.join("mv"), "#!/bin/bash\nexit 1\n").unwrap();
+        std::fs::set_permissions(fake.join("mv"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = home.command();
+        command.env("PATH", format!("{}:/usr/bin:/bin", fake.display()));
+        let out = shell_output(command, &script);
+        assert!(!out.status.success());
+        assert_eq!(
+            std::fs::read_dir(home.0.join(".local/bin"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            std::fs::read_dir(home.0.join(".config/clipaste"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+    #[test]
+    fn discovery_only_accepts_ips_and_auth_capable_metadata() {
+        let candidates = wsl_host_candidates(
             Some("mirrored"),
+            Some("127.0.0.1".into()),
+            Some("evil;echo bad".into()),
+        );
+        assert_eq!(candidates.len(), 1);
+        let nat = wsl_host_candidates(
+            Some("nat"),
             Some("10.255.255.254".into()),
-            Some("192.168.1.1".into()),
-        );
-        assert_eq!(ips(&c), vec!["127.0.0.1", "10.255.255.254", "192.168.1.1"]);
-        assert_eq!(c[0].source, MIRRORED_LOOPBACK);
-    }
-
-    #[test]
-    fn unknown_mode_still_reaches_loopback() {
-        // Older WSL without `wslinfo`: order is unchanged for NAT, but mirrored
-        // setups are still found because loopback is probed as a fallback.
-        let c = wsl_host_candidates(None, Some("10.255.255.254".into()), None);
-        assert_eq!(ips(&c), vec!["10.255.255.254", "127.0.0.1"]);
-    }
-
-    #[test]
-    fn loopback_never_duplicated_when_it_is_also_the_nameserver() {
-        let c = wsl_host_candidates(Some("mirrored"), Some("127.0.0.1".into()), None);
-        assert_eq!(ips(&c), vec!["127.0.0.1"]);
-    }
-
-    #[test]
-    fn candidates_never_empty() {
-        assert_eq!(ips(&wsl_host_candidates(None, None, None)), vec!["127.0.0.1"]);
-    }
-
-    #[test]
-    fn parses_nameserver() {
-        assert_eq!(
-            parse_resolv_nameserver("# generated\nnameserver 10.255.255.254\n").as_deref(),
-            Some("10.255.255.254")
+            Some("172.29.128.1".into()),
         );
         assert_eq!(
-            parse_resolv_nameserver("search local\nnameserver\t172.29.128.1\n").as_deref(),
+            nat.iter().map(|c| c.ip.as_str()).collect::<Vec<_>>(),
+            ["10.255.255.254", "172.29.128.1", "127.0.0.1"]
+        );
+        assert_eq!(
+            parse_resolv_nameserver("# hi\nnameserver\t172.29.128.1\n").as_deref(),
             Some("172.29.128.1")
         );
-        // Commented-out and IPv6 nameservers are not usable host addresses
-        assert_eq!(parse_resolv_nameserver("#nameserver 1.2.3.4\n"), None);
-        assert_eq!(parse_resolv_nameserver("nameserver fe80::1\n"), None);
-        assert_eq!(parse_resolv_nameserver("search corp\n"), None);
-    }
-
-    #[test]
-    fn parses_ip_route_default() {
-        let out = "default via 172.29.128.1 dev eth0 proto kernel\n\
-                   10.0.0.0/8 dev eth0 scope link\n";
-        assert_eq!(parse_ip_route_default(out).as_deref(), Some("172.29.128.1"));
-        // A default route with no gateway (link-scoped) yields nothing
-        assert_eq!(parse_ip_route_default("default dev eth0 scope link\n"), None);
-        assert_eq!(parse_ip_route_default(""), None);
-    }
-
-    #[test]
-    fn parses_proc_net_route() {
-        let content = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n\
-                       eth0\t00000000\t01801FAC\t0003\t0\t0\t0\t00000000\n\
-                       eth0\t0000FEA9\t00000000\t0001\t0\t0\t0\t0000FFFF\n";
-        assert_eq!(parse_proc_net_route(content).as_deref(), Some("172.31.128.1"));
-        // No default route (Destination never 00000000)
-        let none = "Iface\tDestination\tGateway\n\
-                    eth0\t0000FEA9\t00000000\n";
-        assert_eq!(parse_proc_net_route(none), None);
-    }
-
-    #[test]
-    fn health_body_must_identify_clipaste() {
+        assert_eq!(parse_resolv_nameserver("nameserver bad;code\n"), None);
+        assert_eq!(
+            parse_ip_route_default("default via 172.29.128.1 dev eth0\n").as_deref(),
+            Some("172.29.128.1")
+        );
+        assert_eq!(
+            parse_proc_net_route("Iface Destination Gateway\neth0 00000000 01801FAC\n").as_deref(),
+            Some("172.31.128.1")
+        );
         assert!(is_clipaste_health_body(
-            "{\"status\":\"ok\",\"version\":\"2.4.0\"}"
+            "{ \"status\": \"ok\", \"auth\": \"bearer\" }"
         ));
-        assert!(is_clipaste_health_body("{ \"status\": \"ok\" }"));
-        // Some unrelated service answering 200 on the same port must not pass
-        assert!(!is_clipaste_health_body("<html>It works!</html>"));
-        assert!(!is_clipaste_health_body("{\"status\":\"degraded\"}"));
-        assert!(!is_clipaste_health_body(""));
-    }
-
-    // ─── Generated shell payloads ───
-
-    /// The remote setup script and the shims are assembled by string formatting,
-    /// so a syntax error in them would only ever fail on a user's machine. Parse
-    /// them locally with `bash -n` instead.
-    #[cfg(unix)]
-    fn assert_bash_parses(script: &str, label: &str) {
-        use std::io::Read;
-        let mut child = Command::new("bash")
-            .args(["-n"])
-            .stdin(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn bash -n");
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(script.as_bytes())
-            .unwrap();
-        let mut err = String::new();
-        child.stderr.take().unwrap().read_to_string(&mut err).ok();
-        let status = child.wait().unwrap();
-        assert!(status.success(), "{label} is not valid bash:\n{err}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn generated_scripts_are_valid_bash() {
-        let url = "http://127.0.0.1:18340";
-        assert_bash_parses(&build_remote_setup_script(url), "remote setup script");
-        assert_bash_parses(
-            &XCLIP_SHIM_TEMPLATE.replace("__CLIPASTE_URL__", url),
-            "xclip shim",
-        );
-        assert_bash_parses(
-            &WL_PASTE_SHIM_TEMPLATE.replace("__CLIPASTE_URL__", url),
-            "wl-paste shim",
-        );
-        assert_bash_parses(
-            &CLIPASTE_PASTE_TEMPLATE.replace("__CLIPASTE_URL__", url),
-            "clipaste-paste helper",
-        );
-    }
-
-    #[test]
-    fn remote_script_installs_helper_and_patches_path() {
-        let script = build_remote_setup_script("http://127.0.0.1:18340");
-        assert!(script.contains("~/.local/bin/clipaste-paste"));
-        // PATH must be patched even when no rc file exists yet (macOS remote, issue #2)
-        assert!(script.contains("clipaste_ensure_path"));
-        assert!(script.contains(r#"[ -e "$rc" ] || : > "$rc""#));
-    }
-
-    /// Execute the remote payload against a throwaway HOME. On macOS this
-    /// reproduces the issue #2 shape exactly: `uname -s` is Darwin, no rc file
-    /// exists yet, and `clipaste-paste` must still end up on PATH.
-    #[cfg(unix)]
-    #[test]
-    fn remote_script_run_installs_into_empty_home() {
-        let home = std::env::temp_dir().join("clipaste-remote-script-test");
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).unwrap();
-
-        let script = build_remote_setup_script("http://127.0.0.1:18340");
-        let mut child = Command::new("bash")
-            .arg("-s")
-            .env("HOME", &home)
-            .env("SHELL", "/bin/zsh")
-            // Without ~/.local/bin already on PATH, the rc-patching branch runs
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn bash -s");
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(script.as_bytes())
-            .unwrap();
-        let out = child.wait_with_output().unwrap();
-        assert!(
-            out.status.success(),
-            "remote script failed:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-
-        let helper = home.join(".local/bin/clipaste-paste");
-        assert!(helper.is_file(), "clipaste-paste not installed");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&helper).unwrap().permissions().mode();
-            assert_eq!(mode & 0o111, 0o111, "clipaste-paste is not executable");
-        }
-
-        // Neither rc file existed → the login shell's rc is created, not skipped
-        let zshrc = std::fs::read_to_string(home.join(".zshrc")).expect("~/.zshrc not created");
-        assert!(zshrc.contains(r#"export PATH="$HOME/.local/bin:$PATH""#));
-
-        // Re-running must not append a second PATH block
-        let mut again = Command::new("bash")
-            .arg("-s")
-            .env("HOME", &home)
-            .env("SHELL", "/bin/zsh")
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        again
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(script.as_bytes())
-            .unwrap();
-        assert!(again.wait().unwrap().success());
-        let zshrc = std::fs::read_to_string(home.join(".zshrc")).unwrap();
-        assert_eq!(zshrc.matches("clipaste PATH").count(), 1);
-
-        let _ = std::fs::remove_dir_all(&home);
+        assert!(!is_clipaste_health_body("{\"status\":\"ok\"}"));
     }
 }

@@ -2,7 +2,6 @@ name: Check
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 permissions:
@@ -17,8 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --check
       - run: cargo test --locked
-      - run: cargo clippy --locked --all-targets
+      - run: cargo clippy --locked --all-targets -- -D warnings
 
   linux-desktop:
     runs-on: ubuntu-latest

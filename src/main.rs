@@ -4,6 +4,7 @@ mod doctor;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+mod security;
 mod server;
 mod ssh_setup;
 #[cfg(target_os = "windows")]
@@ -22,7 +23,7 @@ fn main() {
     }
 
     // clipaste ssh-setup [-p PORT] user@host [-p PORT]
-    if args.len() >= 3 && args[1] == "ssh-setup" {
+    if args.len() >= 2 && args[1] == "ssh-setup" {
         match parse_ssh_setup_args(&args[2..]) {
             Ok((host, ssh_port)) => {
                 require_clipboard_host();
@@ -40,10 +41,10 @@ fn main() {
     // clipaste wsl-setup [--host IP] (run inside WSL2)
     if args.len() >= 2 && args[1] == "wsl-setup" {
         match parse_wsl_setup_args(&args[2..]) {
-            Ok(host) => ssh_setup::run_wsl(host),
+            Ok((host, token_file)) => ssh_setup::run_wsl(host, token_file.as_deref()),
             Err(e) => {
                 eprintln!("clipaste wsl-setup: {e}");
-                eprintln!("usage: clipaste wsl-setup [--host IP]");
+                eprintln!("usage: clipaste wsl-setup [--host IP] [--token-file PATH]");
                 std::process::exit(1);
             }
         }
@@ -67,6 +68,12 @@ fn main() {
         std::process::exit(doctor::run(json));
     }
 
+    if args.len() > 1 {
+        eprintln!("clipaste: unknown command or argument: {}", args[1]);
+        eprintln!("Run clipaste --help for usage.");
+        std::process::exit(2);
+    }
+
     // Reject unsupported hosts before starting a listener or touching the cache.
     require_clipboard_host();
 
@@ -82,12 +89,26 @@ fn main() {
         std::process::exit(1);
     });
 
-    // Start HTTP server for remote access
+    // Validate retention before creating credentials or reading the clipboard.
+    common::cache_ttl().unwrap_or_else(|e| {
+        eprintln!("clipaste: {e}");
+        std::process::exit(1);
+    });
+    let token = security::load_or_create_token().unwrap_or_else(|e| {
+        eprintln!("clipaste: cannot prepare private credentials: {e}");
+        std::process::exit(1);
+    });
+
     let latest = common::LatestImage::default();
-    if let Err(e) = server::start(latest.clone(), server_only) {
+    if let Err(e) = server::start(latest.clone(), server_only, token) {
         eprintln!("clipaste: cannot start HTTP server: {e}");
         std::process::exit(1);
     }
+
+    common::start_cache_cleanup(latest.clone()).unwrap_or_else(|e| {
+        eprintln!("clipaste: cannot start cache cleanup: {e}");
+        std::process::exit(1);
+    });
 
     // Start clipboard watcher (platform-specific)
     #[cfg(target_os = "macos")]
@@ -122,16 +143,15 @@ fn require_clipboard_host() {
 /// Parse `CLIPASTE_SERVER_ONLY`, which keeps the macOS/Windows clipboard
 /// untouched while images are still served over HTTP (issue #13).
 ///
-/// Only `1` enables it; unset, empty, and `0` leave the default. Anything else
-/// is rejected: a daemon that silently kept rewriting the clipboard after a
-/// typo such as `=true` would break GUI image paste with no visible cause.
+/// Clipboard-preserving mode is the safe default in this fork. Only an
+/// explicit `0` opts into rewriting the clipboard for local path paste.
 fn parse_server_only(value: Option<&std::ffi::OsStr>) -> Result<bool, String> {
     let Some(value) = value else {
-        return Ok(false);
+        return Ok(true);
     };
     match value.to_str() {
-        Some("" | "0") => Ok(false),
-        Some("1") => Ok(true),
+        Some("" | "1") => Ok(true),
+        Some("0") => Ok(false),
         _ => Err(format!(
             "CLIPASTE_SERVER_ONLY must be 1 or 0, not {value:?}"
         )),
@@ -204,12 +224,32 @@ fn parse_ssh_setup_args(args: &[String]) -> Result<(String, Option<u16>), String
 /// `--host IP` / `--host=IP` skips address auto-detection entirely. It exists as
 /// an escape hatch for setups where neither the resolv.conf nameserver, the
 /// default gateway, nor loopback is the reachable address (issue #7).
-fn parse_wsl_setup_args(args: &[String]) -> Result<Option<String>, String> {
+fn parse_wsl_setup_args(
+    args: &[String],
+) -> Result<(Option<String>, Option<std::path::PathBuf>), String> {
     let mut host: Option<String> = None;
+    let mut token_file = None;
 
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
+        if a == "--token-file" {
+            let val = args
+                .get(i + 1)
+                .filter(|v| !v.is_empty() && !v.starts_with('-'))
+                .ok_or_else(|| "--token-file requires a path".to_string())?;
+            token_file = Some(std::path::PathBuf::from(val));
+            i += 2;
+            continue;
+        }
+        if let Some(rest) = a.strip_prefix("--token-file=") {
+            if rest.is_empty() {
+                return Err("--token-file requires a path".to_string());
+            }
+            token_file = Some(std::path::PathBuf::from(rest));
+            i += 1;
+            continue;
+        }
         if a == "--host" {
             let val = args
                 .get(i + 1)
@@ -232,7 +272,7 @@ fn parse_wsl_setup_args(args: &[String]) -> Result<Option<String>, String> {
         return Err(format!("unexpected argument: {a}"));
     }
 
-    Ok(host)
+    Ok((host, token_file))
 }
 
 #[cfg(test)]
@@ -245,9 +285,9 @@ mod tests {
     }
 
     #[test]
-    fn server_only_is_opt_in_with_one() {
-        assert_eq!(parse_server_only(None), Ok(false));
-        assert_eq!(parse_server_only(Some(OsStr::new(""))), Ok(false));
+    fn server_only_is_default_and_rewriting_requires_opt_in() {
+        assert_eq!(parse_server_only(None), Ok(true));
+        assert_eq!(parse_server_only(Some(OsStr::new(""))), Ok(true));
         assert_eq!(parse_server_only(Some(OsStr::new("0"))), Ok(false));
         assert_eq!(parse_server_only(Some(OsStr::new("1"))), Ok(true));
     }
@@ -302,18 +342,18 @@ mod tests {
 
     #[test]
     fn wsl_setup_defaults_to_autodetect() {
-        assert_eq!(parse_wsl_setup_args(&s(&[])).unwrap(), None);
+        assert_eq!(parse_wsl_setup_args(&s(&[])).unwrap(), (None, None));
     }
 
     #[test]
     fn wsl_setup_host_forms() {
         assert_eq!(
             parse_wsl_setup_args(&s(&["--host", "127.0.0.1"])).unwrap(),
-            Some("127.0.0.1".to_string())
+            (Some("127.0.0.1".to_string()), None)
         );
         assert_eq!(
             parse_wsl_setup_args(&s(&["--host=172.29.128.1"])).unwrap(),
-            Some("172.29.128.1".to_string())
+            (Some("172.29.128.1".to_string()), None)
         );
     }
 
@@ -323,6 +363,12 @@ mod tests {
         assert!(parse_wsl_setup_args(&s(&["--host", "--x"])).is_err()); // value looks like a flag
         assert!(parse_wsl_setup_args(&s(&["--host="])).is_err()); // empty value
         assert!(parse_wsl_setup_args(&s(&["10.0.0.1"])).is_err()); // bare positional
-        assert!(parse_wsl_setup_args(&s(&["--nope"])).is_err()); // unknown flag
+        assert!(parse_wsl_setup_args(&s(&["--nope"])).is_err());
+        assert!(parse_wsl_setup_args(&s(&["--token-file"])).is_err());
+        assert!(parse_wsl_setup_args(&s(&["--token-file="])).is_err());
+        assert_eq!(
+            parse_wsl_setup_args(&s(&["--token-file", "/tmp/token"])).unwrap(),
+            (None, Some(std::path::PathBuf::from("/tmp/token")))
+        ); // unknown flag
     }
 }

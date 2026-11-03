@@ -278,10 +278,16 @@ fn stage(
     previous: &mut Option<Vec<u8>>,
     save: impl FnOnce(&[u8]) -> Option<PathBuf>,
 ) -> Result<(), String> {
-    let published = latest.lock().unwrap().clone();
-    if png == previous.as_deref()
-        && (png.is_none() || published.as_ref().is_some_and(|p| p.is_file()))
-    {
+    if png == previous.as_deref() {
+        let mut published = latest.lock().unwrap();
+        if published
+            .as_ref()
+            .is_some_and(|p| !common::cached_image_is_fresh(p))
+        {
+            *published = None;
+        }
+        // Polling the same selection is not an explicit recopy. In particular,
+        // don't re-save and extend the TTL after the cleanup worker expires it.
         return Ok(());
     }
     *latest.lock().unwrap() = None;
@@ -295,6 +301,7 @@ fn stage(
 }
 
 pub fn run(backend: Backend, latest: LatestImage) -> Result<(), String> {
+    common::ensure_temp_dir().map_err(|e| format!("Cannot initialize PNG cache: {e}"))?;
     common::log(&backend.detail);
     if let Some(warning) = &backend.warning {
         common::log(warning);
@@ -477,17 +484,19 @@ mod tests {
         let latest = LatestImage::default();
         let mut previous = None;
         stage(&latest, Some(b"a"), &mut previous, |_| {
-            Some(std::env::current_exe().unwrap())
+            Some(PathBuf::from("nonexistent-test-path"))
         })
         .unwrap();
         stage(&latest, Some(b"a"), &mut previous, |_| {
             panic!("duplicate write")
         })
         .unwrap();
-        assert_eq!(
-            *latest.lock().unwrap(),
-            Some(std::env::current_exe().unwrap())
-        );
+        assert!(latest.lock().unwrap().is_none());
+        // A worker-cleared expired selection must not be silently re-staged.
+        stage(&latest, Some(b"a"), &mut previous, |_| {
+            panic!("expired image refreshed")
+        })
+        .unwrap();
         stage(&latest, None, &mut previous, |_| panic!("non-image write")).unwrap();
         assert!(latest.lock().unwrap().is_none());
         assert!(stage(&latest, Some(b"b"), &mut previous, |_| None).is_err());
