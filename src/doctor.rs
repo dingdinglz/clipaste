@@ -206,6 +206,16 @@ fn parse_helper_url(content: &str) -> Option<String> {
     })
 }
 
+fn clipboard_state(body: &str) -> Option<&'static str> {
+    let compact: String = body.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    match compact.as_str() {
+        "{\"type\":\"image\",\"format\":\"png\"}" => Some("image"),
+        "{\"type\":\"file\",\"format\":\"md\"}" => Some("markdown"),
+        "{\"type\":\"empty\"}" => Some("empty"),
+        _ => None,
+    }
+}
+
 fn is_clipaste_health(body: &str) -> bool {
     let compact = body.replace(' ', "");
     compact.contains("\"status\":\"ok\"") && compact.contains("\"auth\":\"bearer\"")
@@ -430,18 +440,25 @@ fn clipboard_host_checks() -> Vec<Check> {
                 &format!("{base}/clipboard/type"),
                 &token,
             ) {
-                Some(body) if body.contains("\"image\"") => {
+                Some(body) if clipboard_state(&body) == Some("image") => {
                     checks.push(Check::ok("authentication", "private credential accepted"));
                     checks.push(Check::ok(
                         "clipboard",
                         "an image is staged and ready to serve",
                     ));
                 }
-                Some(body) if body.contains("\"empty\"") => {
+                Some(body) if clipboard_state(&body) == Some("markdown") => {
+                    checks.push(Check::ok("authentication", "private credential accepted"));
+                    checks.push(Check::ok(
+                        "clipboard",
+                        "a Markdown file is staged; use clipaste-paste on the remote",
+                    ));
+                }
+                Some(body) if clipboard_state(&body) == Some("empty") => {
                     checks.push(Check::ok("authentication", "private credential accepted"));
                     checks.push(Check::warn(
                         "clipboard",
-                        "no image staged yet — copy a screenshot, then re-run doctor",
+                        "nothing staged yet — copy a screenshot or a supported file, then re-run doctor",
                     ));
                 }
                 _ => checks.push(Check::fail(
@@ -550,14 +567,10 @@ fn consumer_checks(role: Role) -> Vec<Check> {
                 Ok(token) => {
                     match security::http_get_authenticated(&format!("{url}/clipboard/type"), &token)
                     {
-                        Some(state)
-                            if state.contains("\"image\"") || state.contains("\"empty\"") =>
-                        {
-                            checks.push(Check::ok(
-                                "authentication",
-                                "private credential accepted by clipboard host",
-                            ))
-                        }
+                        Some(state) if clipboard_state(&state).is_some() => checks.push(Check::ok(
+                            "authentication",
+                            "private credential accepted by clipboard host",
+                        )),
                         _ => checks.push(
                             Check::fail("authentication", "clipboard host rejected the credential")
                                 .with_fix(&setup_hint),
@@ -758,6 +771,24 @@ mod tests {
             parse_helper_url("CLIPASTE_URL='http://127.0.0.1:18340'\n").as_deref(),
             Some("http://127.0.0.1:18340")
         );
+    }
+
+    #[test]
+    fn clipboard_diagnostics_accept_only_supported_payload_types() {
+        assert_eq!(
+            clipboard_state("{\"type\":\"image\",\"format\":\"png\"}"),
+            Some("image")
+        );
+        assert_eq!(
+            clipboard_state("{ \"type\": \"file\", \"format\": \"md\" }"),
+            Some("markdown")
+        );
+        assert_eq!(clipboard_state("{\"type\":\"empty\"}"), Some("empty"));
+        assert_eq!(
+            clipboard_state("{\"type\":\"file\",\"format\":\"zip\"}"),
+            None
+        );
+        assert_eq!(clipboard_state("{\"image\":true}"), None);
     }
 
     #[test]

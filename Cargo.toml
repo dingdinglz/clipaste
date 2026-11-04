@@ -1,13 +1,13 @@
 [package]
 name = "clipaste"
-version = "2.6.1-dingdinglz.1"
+version = "2.6.1-dingdinglz.2"
 edition = "2021"
-description = "Bridge macOS, Windows and Linux screenshots to terminal AI tools"
+description = "Bridge clipboard images and Markdown files to remote terminal AI tools"
 license = "MIT"
 repository = "https://github.com/dingdinglz/clipaste"
 
 [dependencies]
-image = { version = "0.25", default-features = false, features = ["tiff", "png", "bmp"] }
+image = { version = "0.25", default-features = false, features = ["tiff", "png", "bmp", "jpeg"] }
 sha2 = "0.10.9"
 # Authentication tokens must use the operating system CSPRNG, not timestamps.
 getrandom = "0.3"

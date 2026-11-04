@@ -1,6 +1,6 @@
 # clipaste — hardened fork
 
-Paste local clipboard images into Claude Code over SSH. Fork of
+Paste local clipboard images and copied Markdown files into Claude Code over SSH. Fork of
 [hqhq1025/clipaste](https://github.com/hqhq1025/clipaste), maintained here at
 [dingdinglz/clipaste](https://github.com/dingdinglz/clipaste).
 
@@ -18,7 +18,7 @@ advertised; install from source.
 - The local clipboard is **left untouched by default**. SSH image paste still
   works. Explicitly set `CLIPASTE_SERVER_ONLY=0` to enable upstream-style local
   file-path paste.
-- Image caches expire after **one hour** by default. Cleanup runs at startup and
+- Image and Markdown caches expire after **one hour** by default. Cleanup runs at startup and
   approximately once per minute while the daemon runs. Expired images cannot be
   fetched even before the next cleanup pass.
 - SSH configuration gets a private backup and an atomic replacement. Setup adds
@@ -64,6 +64,25 @@ is already running, stop it before starting this fork; the port cannot be shared
 For macOS, that may mean `brew services stop clipaste`. Do not restart it using
 `brew services start clipaste`, which would start the upstream binary again.
 
+## Supported formats
+
+| Clipboard source | Supported inputs | Remote result |
+|---|---|---|
+| Mac screenshot / copied image pixels | PNG, TIFF, JPEG | PNG image; Claude Code on Linux uses Control+V |
+| One image file copied in Mac Finder | `.png`, `.tif`, `.tiff`, `.bmp`, `.jpg`, `.jpeg` (case-insensitive) | Validated and converted to PNG |
+| One file copied in Mac Finder | `.md` (UTF-8, no NUL bytes, including empty files) | Exact Markdown bytes in a private remote `.md` file |
+
+Images are limited to 64 MiB; Markdown files to 4 MiB. Symlinks, multiple-file
+copies, private-marked clipboard entries and unsupported formats are rejected.
+The new copied-file formats are captured on **macOS**; Windows/Linux clipboard
+hosts retain their existing image-only capture behavior. Plain copied text is
+not automatically turned into an uploaded Markdown file.
+
+**Markdown does not use Claude Code's image-only Control+V binding.** Copy the
+`.md` file in Finder, run `clipaste-paste` on the remote, then paste the printed
+remote path into Claude. You can also ask Claude to run `clipaste-paste` and read
+that path. The helper only transfers the bytes; it never executes Markdown code.
+
 ## SSH setup: Mac → Linux Claude Code
 
 On your local clipboard host, while the daemon is running:
@@ -93,12 +112,26 @@ Copy an image locally, then press **Control+V** in remote Claude Code on Linux.
 
 For a remote Mac, Codex CLI, or tools that read image files rather than invoking
 clipboard helpers, run `clipaste-paste` on the remote and give its printed path
-to the agent. Helper image files are private and expire through cleanup on the
+to the agent. The same helper supports copied `.md` files. Helper files are
+private and expire through cleanup on the
 next helper invocation after one hour; they are not removed by a system timer.
 
 Keep your desktop user and server account trusted. A remote administrator, or
 another process running as your remote Unix account, can still use its token.
 This is not a sandbox against those actors.
+
+## Upgrade after adding file support
+
+```bash
+cd ~/Developer/clipaste  # or your clone directory
+git pull --ff-only
+cargo install --path . --locked
+```
+
+Stop your existing foreground daemon with Control+C and restart the new binary.
+Then rerun `clipaste ssh-setup your-server` locally to update the remote helpers,
+and open a new SSH connection. Updating only the daemon is not enough for
+Markdown: old remote helpers deliberately reject unknown payload types.
 
 ## WSL2
 
@@ -126,11 +159,11 @@ clipboard service publicly to work around networking limitations.
 | Variable | Default | Meaning |
 |---|---|---|
 | `CLIPASTE_SERVER_ONLY` | `1` | Leave the local clipboard unchanged; `0` opts into local path normalization |
-| `CLIPASTE_CACHE_TTL_SECONDS` | `3600` | Local image retention; `0` explicitly opts into indefinite retention |
+| `CLIPASTE_CACHE_TTL_SECONDS` | `3600` | Local image/Markdown retention; `0` explicitly opts into indefinite retention |
 | `CLIPASTE_BACKEND` | `auto` | Linux only: `auto`, `wayland`, or `x11` |
 
 Environment settings belong to the **daemon**, not the SSH client. Clearing the
-clipboard clears the currently served image; cached copies remain until expiry.
+clipboard clears the currently served image/file; cached copies remain until expiry.
 Closing the daemon stops cleanup; expired files are removed on its next start.
 Clipboard history managers may retain independent copies. Expiring a PNG also
 invalidates clipboard-history entries that reference its path.

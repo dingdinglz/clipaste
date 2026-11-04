@@ -3,7 +3,7 @@
 Canonical repository: https://github.com/dingdinglz/clipaste
 Read README.md, SECURITY.md and AGENTS.md in that repository before installing.
 
-This fork requires bearer authentication for clipboard type and image endpoints.
+This fork requires bearer authentication for clipboard type, image and file endpoints.
 Only /health is public metadata. Tokens use OS randomness and private configuration
 files. Never place tokens in command-line arguments, URLs, logs or chat messages.
 
@@ -20,6 +20,15 @@ Local clipboard host: run clipaste, then in another terminal run
 clipaste ssh-setup user@host. Reconnect using the same destination. Linux remote
 Claude Code uses Control+V, not Command+V. Codex and macOS remotes use
 clipaste-paste and hand the resulting remote path to the agent.
+
+Mac copied image files support PNG/TIFF/BMP/JPG/JPEG and become PNG images.
+A single copied .md file is transferred byte-exact as Markdown (UTF-8, no NUL,
+maximum 4 MiB, empty files allowed). Markdown uses clipaste-paste and its remote
+.md path, not Claude's image-only Control+V binding. Ordinary copied text is not
+captured. Windows/Linux clipboard hosts retain image-only capture.
+After upgrading the daemon, rerun ssh-setup and reconnect to update helpers.
+/clipboard/file only returns Markdown; /clipboard/image never returns Markdown.
+Both require authentication and obey cache expiry. Never execute file contents.
 
 WSL setup imports the Windows credential explicitly with --token-file PATH.
 Keep token copies private (Unix0600) and use literal IP addresses for --host.

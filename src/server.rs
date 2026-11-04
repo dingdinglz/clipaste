@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 const MAX_HEADERS: usize = 8192;
 const MAX_CONNECTIONS: usize = 16;
-const MAX_IMAGE: u64 = 64 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The listener never leaves loopback. A token is required even through SSH:
@@ -153,6 +152,11 @@ fn fresh_path(latest: &LatestImage) -> Option<std::path::PathBuf> {
     }
     if let Ok(mut guard) = latest.lock() {
         if guard.as_ref() == Some(&path) {
+            // An identical-byte recopy can refresh this same cache path between
+            // the first metadata check and acquiring the state lock.
+            if common::cached_image_is_fresh(&path) {
+                return Some(path);
+            }
             *guard = None;
         }
     }
@@ -175,16 +179,35 @@ fn route(request: Request<'_>, latest: &LatestImage, server_only: bool, token: &
     }
     match request.path {
         "/clipboard/type" => {
-            let body = if fresh_path(latest).is_some() {
-                b"{\"type\":\"image\",\"format\":\"png\"}".as_slice()
-            } else {
-                b"{\"type\":\"empty\"}".as_slice()
+            let kind = fresh_path(latest)
+                .as_deref()
+                .and_then(common::clipboard_kind);
+            let body = match kind {
+                Some(common::ClipboardKind::Image) => {
+                    b"{\"type\":\"image\",\"format\":\"png\"}".as_slice()
+                }
+                Some(common::ClipboardKind::Markdown) => {
+                    b"{\"type\":\"file\",\"format\":\"md\"}".as_slice()
+                }
+                None => b"{\"type\":\"empty\"}".as_slice(),
             };
             Response::new(200, "application/json", body.to_vec())
         }
-        "/clipboard/image" => {
+        "/clipboard/image" | "/clipboard/file" => {
             let Some(path) = fresh_path(latest) else {
                 return Response::new(204, "text/plain", Vec::new());
+            };
+            let expected = if request.path == "/clipboard/image" {
+                common::ClipboardKind::Image
+            } else {
+                common::ClipboardKind::Markdown
+            };
+            if common::clipboard_kind(&path) != Some(expected) {
+                return Response::new(204, "text/plain", Vec::new());
+            }
+            let limit = match expected {
+                common::ClipboardKind::Image => common::MAX_IMAGE_BYTES as u64,
+                common::ClipboardKind::Markdown => common::MAX_MARKDOWN_BYTES as u64,
             };
             let read = || -> io::Result<Vec<u8>> {
                 let mut options = std::fs::OpenOptions::new();
@@ -196,18 +219,30 @@ fn route(request: Request<'_>, latest: &LatestImage, server_only: bool, token: &
                 }
                 let file = options.open(&path)?;
                 let meta = file.metadata()?;
-                if !meta.is_file() || meta.len() > MAX_IMAGE {
-                    return Err(io::Error::other("invalid cache image"));
+                if !meta.is_file() || meta.len() > limit {
+                    return Err(io::Error::other("invalid cached clipboard file"));
                 }
                 let mut data = Vec::new();
-                file.take(MAX_IMAGE + 1).read_to_end(&mut data)?;
-                if data.len() as u64 > MAX_IMAGE {
-                    return Err(io::Error::other("image too large"));
+                file.take(limit + 1).read_to_end(&mut data)?;
+                if data.len() as u64 > limit {
+                    return Err(io::Error::other("clipboard file too large"));
+                }
+                if expected == common::ClipboardKind::Markdown && !common::validate_markdown(&data)
+                {
+                    return Err(io::Error::other("invalid cached Markdown"));
                 }
                 Ok(data)
             };
             match read() {
-                Ok(data) => Response::new(200, "image/png", data),
+                Ok(data) => Response::new(
+                    200,
+                    if expected == common::ClipboardKind::Image {
+                        "image/png"
+                    } else {
+                        "text/markdown; charset=utf-8"
+                    },
+                    data,
+                ),
                 Err(_) => Response::error(404),
             }
         }
@@ -295,7 +330,7 @@ mod tests {
         assert!(String::from_utf8(health.body)
             .unwrap()
             .contains("\"auth\":\"bearer\""));
-        for path in ["/clipboard/type", "/clipboard/image"] {
+        for path in ["/clipboard/type", "/clipboard/image", "/clipboard/file"] {
             assert_eq!(response(path, "").status, 401);
             assert_eq!(
                 response(
@@ -309,6 +344,7 @@ mod tests {
         let header = format!("Authorization: Bearer {}\r\n", "a".repeat(64));
         assert_eq!(response("/clipboard/type", &header).status, 200);
         assert_eq!(response("/clipboard/image", &header).status, 204);
+        assert_eq!(response("/clipboard/file", &header).status, 204);
         assert_eq!(response("/clipboard/image-extra", &header).status, 404);
     }
     #[test]
@@ -395,6 +431,116 @@ mod tests {
             );
             assert!(latest.lock().unwrap().is_none());
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn markdown_is_authenticated_byte_exact_and_never_an_image() {
+        use std::fs;
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "clipaste-md-http-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("document.md");
+        let token = "a".repeat(64);
+        let latest = LatestImage::default();
+        for bytes in [
+            "# 你好\r\n\n```bash\n$(touch should-never-run)\n```\n".as_bytes(),
+            b"".as_slice(),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            *latest.lock().unwrap() = Some(path.clone());
+            assert_eq!(
+                route(
+                    Request {
+                        path: "/clipboard/file",
+                        bearer: None
+                    },
+                    &latest,
+                    true,
+                    &token
+                )
+                .status,
+                401
+            );
+            let state = route(
+                Request {
+                    path: "/clipboard/type",
+                    bearer: Some(&token),
+                },
+                &latest,
+                true,
+                &token,
+            );
+            assert_eq!(state.body, b"{\"type\":\"file\",\"format\":\"md\"}");
+            let file = route(
+                Request {
+                    path: "/clipboard/file",
+                    bearer: Some(&token),
+                },
+                &latest,
+                true,
+                &token,
+            );
+            assert_eq!(file.status, 200);
+            assert_eq!(file.content_type, "text/markdown; charset=utf-8");
+            assert_eq!(file.body, bytes);
+            assert_eq!(
+                route(
+                    Request {
+                        path: "/clipboard/image",
+                        bearer: Some(&token)
+                    },
+                    &latest,
+                    true,
+                    &token
+                )
+                .status,
+                204
+            );
+        }
+        fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert_eq!(
+            route(
+                Request {
+                    path: "/clipboard/file",
+                    bearer: Some(&token)
+                },
+                &latest,
+                true,
+                &token
+            )
+            .status,
+            404
+        );
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(common::MAX_MARKDOWN_BYTES as u64 + 1)
+            .unwrap();
+        assert_eq!(
+            route(
+                Request {
+                    path: "/clipboard/file",
+                    bearer: Some(&token)
+                },
+                &latest,
+                true,
+                &token
+            )
+            .status,
+            204
+        );
+        assert!(latest.lock().unwrap().is_none());
         fs::remove_dir_all(dir).unwrap();
     }
 

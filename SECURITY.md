@@ -9,8 +9,8 @@ unauthenticated upstream clipboard helpers.
 - A trusted desktop user runs the clipboard daemon without administrator rights.
 - Only explicitly configured, trusted SSH/WSL accounts receive its credential.
 - The daemon binds `127.0.0.1:18340`. Do not expose it on a public address.
-- `/clipboard/type` and `/clipboard/image` require a 256-bit OS-random bearer
-  token. `/health` is public metadata and exposes neither the image nor its
+- `/clipboard/type`, `/clipboard/image` and `/clipboard/file` require a 256-bit
+  OS-random bearer token. `/health` is public metadata and exposes neither the image nor its
   presence. Diagnostic success requires an authenticated clipboard-state probe.
 - Normal SSH transport remains encrypted and uses normal host-key checking.
   No SSH verification bypass is installed.
@@ -47,14 +47,17 @@ To revoke a credential, stop the daemon, remove its token file, restart it, and
 rerun setup for every trusted remote. Remove obsolete remote token copies and
 managed SSH blocks. Do not post a token in an issue or paste it into Claude.
 
-## Image handling and retention
+## Image and Markdown handling and retention
 
 The fork leaves the local clipboard unchanged by default. It still automatically
 observes qualifying images and stores them in its private cache. This is not an
-explicit-send-only tool. Image-file copies and raw image bytes respect the
-recognized privacy markers; arbitrary applications need not supply those markers.
+explicit-send-only tool. Copied image/Markdown files and raw image bytes respect
+the recognized privacy markers; arbitrary applications need not supply them.
+On macOS, copying a single `.md` file in Finder automatically stages that file;
+ordinary copied text is not captured. Treat copied private documents accordingly.
+Only supported regular non-symlink files are accepted.
 
-Images expire after 3600 seconds by default. They become unavailable over HTTP
+Images and Markdown files expire after 3600 seconds by default. They become unavailable over HTTP
 when expired, and regular managed cache files are deleted at startup and at
 approximately 60-second intervals while the daemon runs. This is deletion, **not
 secure erasure**; disk snapshots, backups and clipboard history may retain copies.
@@ -62,12 +65,19 @@ If the daemon is stopped, deletion waits until the next run. A new copy of the
 same image can refresh retention. `CLIPASTE_CACHE_TTL_SECONDS=0` is an explicit
 opt-in to indefinite retention.
 
-Remote `clipaste-paste` files live in a private directory. Its old images are
+Remote `clipaste-paste` files live in a private directory. Its old images/files are
 cleaned on subsequent helper invocations, not by a scheduler. The native clipboard
 wrappers use private temporary files and cleanup traps. Killing processes
 abnormally can leave files behind; no secure-erasure guarantee is made.
 
-Images are bounded to 64 MiB; image decoding has allocation/dimension limits.
+Images (including JPEG inputs converted to PNG) are bounded to 64 MiB; image
+decoding has allocation/dimension limits. Markdown is limited to 4 MiB of valid
+UTF-8 without NUL bytes. Files preserve Markdown bytes exactly, including empty
+files; they are not parsed, rendered, executed or used as shell commands. Source
+filenames do not become shell commands or remote output paths. `/clipboard/image`
+never returns Markdown; `/clipboard/file` only returns Markdown, preventing type
+confusion with image consumers. Old helpers fail closed on the new file type.
+The recipient agent must treat document contents as data, not trusted commands.
 HTTP workers, header sizes and I/O waits are bounded. These are defenses in depth,
 not protection against a hostile process already executing as your user.
 

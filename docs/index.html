@@ -12,8 +12,9 @@
   <p>Paste local clipboard images into Claude Code running on a trusted SSH server.</p>
   <ul>
     <li>Bearer authentication for clipboard state and image data.</li>
+    <li>Mac copied JPG/JPEG images convert to PNG; copied UTF-8 Markdown files transfer with <code>clipaste-paste</code>.</li>
     <li>Local clipboard left unchanged by default.</li>
-    <li>Image caches expire after one hour by default.</li>
+    <li>Image and Markdown caches expire after one hour by default.</li>
     <li>Private credentials, bounded HTTP, safer SSH configuration and helper installation.</li>
   </ul>
   <p>This fork currently requires a reviewed source build. Upstream Homebrew packages and binary releases do not include these changes. No fork binary release is advertised.</p>

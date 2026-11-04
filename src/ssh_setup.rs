@@ -70,9 +70,9 @@ clipaste_type() {
     clipaste_load_token
     local body
     body=$(clipaste_curl "$CLIPASTE_URL/clipboard/type") || clipaste_die 'authentication or transport failed (no native fallback)'
-    body=$(printf '%s' "$body" | tr -d '[:space:]')
     case "$body" in
         '{"type":"image","format":"png"}') clipaste_kind=image ;;
+        '{"type":"file","format":"md"}') clipaste_kind=markdown ;;
         '{"type":"empty"}') clipaste_kind=empty ;;
         *) clipaste_die 'invalid clipboard response (no native fallback)' ;;
     esac
@@ -89,19 +89,28 @@ clipaste_fetch() {
     local cache="${XDG_CACHE_HOME:-$HOME/.cache}/clipaste"
     clipaste_private_dir "$cache"
     clipaste_private_dir "$cache/paste"
-    # This directory is dedicated to our private managed downloads. Do not
-    # traverse directories, links, or remove other names/owners/permissions.
-    find "$cache/paste/." ! -name . -prune -type f -name 'clipaste-image.*' -user "$(id -u)" -links 1 -perm 0600 -mmin +59 -exec rm -f {} + || clipaste_die 'cannot expire managed images'
-    # BSD mktemp appends random characters if Xs are followed by .png. Reserve
-    # a portable template first, then publish a .png name without overwriting.
-    clipaste_tmp=$(mktemp "$cache/paste/clipaste-image.XXXXXXXX") || clipaste_die 'mktemp failed'
-    ln "$clipaste_tmp" "$clipaste_tmp.png" || clipaste_die 'cannot reserve PNG filename'
+    # Never traverse directories or expire unrelated names, links or modes.
+    find "$cache/paste/." ! -name . -prune -type f \( -name 'clipaste-image.*' -o -name 'clipaste-download.*' \) -user "$(id -u)" -links 1 -perm 0600 -mmin +59 -exec rm -f {} + || clipaste_die 'cannot expire managed downloads'
+    local ext endpoint limit status
+    case "$clipaste_kind" in
+        image) ext=png; endpoint=image; limit=67108864 ;;
+        markdown) ext=md; endpoint=file; limit=4194304 ;;
+        *) clipaste_die 'unsupported clipboard type' ;;
+    esac
+    # Reserve a portable template, then publish the extension without overwrite.
+    clipaste_tmp=$(mktemp "$cache/paste/clipaste-download.XXXXXXXX") || clipaste_die 'mktemp failed'
+    ln "$clipaste_tmp" "$clipaste_tmp.$ext" || clipaste_die 'cannot reserve download filename'
     clipaste_reservation="$clipaste_tmp"
-    clipaste_tmp="$clipaste_tmp.png"
+    clipaste_tmp="$clipaste_tmp.$ext"
     rm -f "$clipaste_reservation" || clipaste_die 'cannot release filename reservation'
     clipaste_reservation=''
-    chmod 600 "$clipaste_tmp" || clipaste_die 'cannot secure image'
-    clipaste_curl -o "$clipaste_tmp" "$CLIPASTE_URL/clipboard/image" && [ -s "$clipaste_tmp" ] || clipaste_die 'image fetch failed (no native fallback)'
+    chmod 600 "$clipaste_tmp" || clipaste_die 'cannot secure download'
+    status=$(clipaste_curl --max-filesize "$limit" --write-out '%{http_code}' -o "$clipaste_tmp" "$CLIPASTE_URL/clipboard/$endpoint") || clipaste_die 'clipboard fetch failed (no native fallback)'
+    [ "$status" = 200 ] || clipaste_die 'clipboard changed or expired (no native fallback)'
+    [ "$(clipaste_size "$clipaste_tmp")" -le "$limit" ] || clipaste_die 'clipboard download too large'
+    if [ "$clipaste_kind" = image ]; then
+        [ -s "$clipaste_tmp" ] || clipaste_die 'empty image (no native fallback)'
+    fi
 }
 clipaste_native() {
     local tool="$1" rest="$PATH" dir candidate
@@ -126,10 +135,19 @@ case "$*" in
     *"-selection clipboard"*"-t TARGETS"*"-o"*|*"-sel clip"*"-t TARGETS"*"-o"*)
         clipaste_type
         if [ "$clipaste_kind" = image ]; then printf 'TARGETS\nimage/png\n'; exit 0; fi
+        if [ "$clipaste_kind" = markdown ]; then printf 'TARGETS\ntext/markdown\ntext/plain\n'; exit 0; fi
         ;;
-    *"-selection clipboard"*"-t image/png"*"-o"*|*"-sel clip"*"-t image/png"*"-o"*)
+    *"-selection clipboard"*"-t image/"*"-o"*|*"-sel clip"*"-t image/"*"-o"*)
         clipaste_type
-        if [ "$clipaste_kind" = image ]; then clipaste_fetch; cat "$clipaste_tmp"; exit $?; fi
+        [ "$clipaste_kind" != markdown ] || clipaste_die 'Markdown is not an image; use clipaste-paste'
+        case "$*" in
+            *"-t image/png"*)
+                if [ "$clipaste_kind" = image ]; then clipaste_fetch; cat "$clipaste_tmp"; exit $?; fi ;;
+        esac
+        ;;
+    *"-selection clipboard"*"-t text/markdown"*"-o"*|*"-sel clip"*"-t text/markdown"*"-o"*|*"-selection clipboard"*"-t text/plain"*"-o"*|*"-sel clip"*"-t text/plain"*"-o"*)
+        clipaste_type
+        if [ "$clipaste_kind" = markdown ]; then clipaste_fetch; cat "$clipaste_tmp"; exit $?; fi
         ;;
 esac
 clipaste_native xclip "$@"
@@ -139,17 +157,23 @@ case "$*" in
     *"--list-types"*)
         clipaste_type
         if [ "$clipaste_kind" = image ]; then printf 'image/png\n'; exit 0; fi
+        if [ "$clipaste_kind" = markdown ]; then printf 'text/markdown\ntext/plain\n'; exit 0; fi
         ;;
     *"--type image/"*|*"-t image/"*)
         clipaste_type
+        [ "$clipaste_kind" != markdown ] || clipaste_die 'Markdown is not an image; use clipaste-paste'
         if [ "$clipaste_kind" = image ]; then clipaste_fetch; cat "$clipaste_tmp"; exit $?; fi
+        ;;
+    *"--type text/markdown"*|*"-t text/markdown"*|*"--type text/plain"*|*"-t text/plain"*)
+        clipaste_type
+        if [ "$clipaste_kind" = markdown ]; then clipaste_fetch; cat "$clipaste_tmp"; exit $?; fi
         ;;
 esac
 clipaste_native wl-paste "$@"
 "#;
 const PASTE_BODY: &str = r#"
 clipaste_type
-[ "$clipaste_kind" = image ] || clipaste_die 'no image on clipboard; take a screenshot first'
+[ "$clipaste_kind" != empty ] || clipaste_die 'no image or Markdown file on clipboard'
 clipaste_fetch
 printf '%s\n' "$clipaste_tmp"
 # The printed file stays usable for one hour; subsequent helper calls expire it.
@@ -360,12 +384,21 @@ fn install_shims_locally(url: &str, token: &str) -> Result<(), String> {
     run_payload(Command::new("bash"), &script, token).map(|_| ())
 }
 
+fn valid_clipboard_type(body: &str) -> bool {
+    matches!(
+        body,
+        r#"{"type":"image","format":"png"}"#
+            | r#"{"type":"file","format":"md"}"#
+            | r#"{"type":"empty"}"#
+    )
+}
+
 fn verify_auth(url: &str, token: &str) -> Result<(), String> {
     if !security::valid_token(token) {
         return Err("invalid token".into());
     }
     match security::http_get_authenticated(&format!("{url}/clipboard/type"), token) {
-        Some(body) if body.contains("\"type\":\"image\"") || body.contains("\"type\":\"empty\"") => Ok(()),
+        Some(body) if valid_clipboard_type(&body) => Ok(()),
         _ => Err("authenticated /clipboard/type check failed; check the daemon and token (nothing installed)".into()),
     }
 }
@@ -1289,31 +1322,185 @@ mod tests {
             r#"#!/bin/bash
 printf '<%s>\n' "$@" > "$HOME/curl-argv"
 cat > "$HOME/curl-stdin"
-output=''
+output='' status_format='' limit='' url=''
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -o) output="$2"; shift ;;
-        */clipboard/type)
-            case "${FAKE_TYPE:-image}" in
-                fail) exit 22 ;;
-                empty) printf '{"type":"empty"}' ;;
-                malformed) printf 'bad response' ;;
-                *) printf '{"type":"image","format":"png"}' ;;
-            esac
-            exit 0 ;;
-        */clipboard/image)
-            [ "${FAKE_IMAGE:-ok}" = ok ] || exit 22
-            printf 'dummy PNG' > "$output"
-            exit 0 ;;
+        --write-out) status_format="$2"; shift ;;
+        --max-filesize) limit="$2"; shift ;;
+        */clipboard/*) url="$1" ;;
     esac
     shift
 done
-exit 99
+case "$url" in
+    */clipboard/type)
+        case "${FAKE_TYPE:-image}" in
+            fail) exit 22 ;;
+            empty) printf '{"type":"empty"}' ;;
+            markdown) printf '{"type":"file","format":"md"}' ;;
+            malformed) printf 'bad response' ;;
+            unknown) printf '{"type":"file","format":"txt"}' ;;
+            *) printf '{"type":"image","format":"png"}' ;;
+        esac ;;
+    */clipboard/image|*/clipboard/file)
+        [ "${FAKE_IMAGE:-ok}" = ok ] || exit 22
+        if [ "${FAKE_STATUS:-200}" = 200 ]; then
+            if [[ "$url" = */clipboard/file ]]; then
+                [ "$limit" = 4194304 ] || exit 98
+                cat "$HOME/payload" > "$output"
+            else
+                [ "$limit" = 67108864 ] || exit 98
+                if [ "${FAKE_EMPTY_IMAGE:-0}" = 1 ]; then : > "$output"; else printf 'dummy PNG' > "$output"; fi
+            fi
+            size=$(wc -c < "$output")
+            [ "$size" -le "$limit" ] || exit 63
+        fi
+        [ "$status_format" = '%{http_code}' ] || exit 97
+        printf '%s' "${FAKE_STATUS:-200}" ;;
+    *) exit 99 ;;
+esac
 "#,
         )
         .unwrap();
         std::fs::set_permissions(curl, std::fs::Permissions::from_mode(0o700)).unwrap();
         dir
+    }
+    #[test]
+    fn clipboard_type_validation_is_exact() {
+        for body in [
+            r#"{"type":"file","format":"md"}"#,
+            r#"{"type":"image","format":"png"}"#,
+            r#"{"type":"empty"}"#,
+        ] {
+            assert!(valid_clipboard_type(body));
+        }
+        for body in [
+            r#"{"status":"ok"}"#,
+            r#"{"type":"file","format":"txt"}"#,
+            r#"{"type":"image","format":"jpeg"}"#,
+            r#"{"type":"empty","extra":true}"#,
+            "garbage {\"type\":\"empty\"}",
+        ] {
+            assert!(!valid_clipboard_type(body));
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn markdown_helpers_preserve_bytes_and_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempHome::new();
+        let installer = build_remote_setup_script(URL, TOKEN).unwrap();
+        success(home.run(&installer));
+        let helper = home.0.join(".local/bin/clipaste-paste");
+        // The existing v2 header is deliberately retained for safe upgrades.
+        std::fs::write(
+            &helper,
+            "#!/bin/bash\n# clipaste managed helper v2: clipaste-paste\nexit 99\n",
+        )
+        .unwrap();
+        success(home.run(&installer));
+        assert!(std::fs::read_to_string(&helper)
+            .unwrap()
+            .contains("endpoint=file"));
+        let fake = fake_curl(&home);
+        let path = format!("{}:/usr/bin:/bin", fake.display());
+        let run = |kind: &str, status: &str| {
+            home.command()
+                .arg(&helper)
+                .env("PATH", &path)
+                .env("FAKE_TYPE", kind)
+                .env("FAKE_STATUS", status)
+                .output()
+                .unwrap()
+        };
+        let payload = b"# raw\r\n$(touch NEVER_EXECUTE)\n```sh\nfalse\n```\n\0end\n\n";
+        let mut downloads = Vec::new();
+        for bytes in [payload.as_slice(), b""] {
+            std::fs::write(home.0.join("payload"), bytes).unwrap();
+            let out = run("markdown", "200");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let file = PathBuf::from(String::from_utf8(out.stdout).unwrap().trim());
+            assert_eq!(file.extension().unwrap(), "md");
+            assert_eq!(std::fs::read(&file).unwrap(), bytes);
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            downloads.push(file);
+        }
+        let cache = downloads[0].parent().unwrap();
+        let count = std::fs::read_dir(cache).unwrap().count();
+        for (kind, status) in [
+            ("markdown", "204"),
+            ("markdown", "401"),
+            ("fail", "200"),
+            ("unknown", "200"),
+        ] {
+            let out = run(kind, status);
+            assert!(!out.status.success());
+            assert!(out.stdout.is_empty());
+            assert_eq!(std::fs::read_dir(cache).unwrap().count(), count);
+        }
+        std::fs::write(home.0.join("payload"), vec![b'x'; 4194305]).unwrap();
+        assert!(!run("markdown", "200").status.success());
+        assert_eq!(std::fs::read_dir(cache).unwrap().count(), count);
+        std::fs::write(home.0.join("payload"), payload).unwrap();
+        for tool in ["xclip", "wl-paste"] {
+            let shim = home.0.join(".local/bin").join(tool);
+            std::fs::write(&shim, helper_script(tool, URL)).unwrap();
+            let native = fake.join(tool);
+            std::fs::write(&native, "#!/bin/bash\nprintf native\n").unwrap();
+            std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let args: Vec<Vec<&str>> = if tool == "xclip" {
+                vec![
+                    vec!["-selection", "clipboard", "-t", "TARGETS", "-o"],
+                    vec!["-selection", "clipboard", "-t", "image/png", "-o"],
+                    vec!["-selection", "clipboard", "-t", "text/markdown", "-o"],
+                ]
+            } else {
+                vec![
+                    vec!["--list-types"],
+                    vec!["--type", "image/png"],
+                    vec!["--type", "text/markdown"],
+                ]
+            };
+            for (i, argv) in args.iter().enumerate() {
+                let out = home
+                    .command()
+                    .arg(&shim)
+                    .args(argv)
+                    .env("PATH", &path)
+                    .env("FAKE_TYPE", "markdown")
+                    .output()
+                    .unwrap();
+                assert_eq!(out.status.success(), i != 1);
+                match i {
+                    0 => {
+                        let types = String::from_utf8(out.stdout).unwrap();
+                        assert!(types.contains("text/markdown\ntext/plain\n"));
+                        assert!(!types.contains("image/"));
+                    }
+                    1 => {
+                        assert!(String::from_utf8_lossy(&out.stderr).contains("use clipaste-paste"))
+                    }
+                    _ => assert_eq!(out.stdout, payload),
+                }
+            }
+        }
+        success(
+            Command::new("touch")
+                .args(["-t", "200001010000"])
+                .args(&downloads)
+                .output()
+                .unwrap(),
+        );
+        success(run("markdown", "200"));
+        assert!(downloads.iter().all(|file| !file.exists()));
+        assert!(!home.0.join("NEVER_EXECUTE").exists());
     }
     #[cfg(unix)]
     #[test]
@@ -1336,7 +1523,12 @@ exit 99
             String::from_utf8_lossy(&output.stderr)
         );
         let image = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+        assert_eq!(image.extension().unwrap(), "png");
+        assert_eq!(std::fs::read(&image).unwrap(), b"dummy PNG");
         let cache = image.parent().unwrap();
+        let legacy = cache.join("clipaste-image.legacy.png");
+        std::fs::write(&legacy, "legacy").unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
             std::fs::metadata(&image).unwrap().permissions().mode() & 0o777,
             0o600
@@ -1358,6 +1550,7 @@ exit 99
             Command::new("touch")
                 .args(["-t", "200001010000"])
                 .arg(&image)
+                .arg(&legacy)
                 .arg(&unrelated)
                 .arg(&nested_file)
                 .output()
@@ -1371,6 +1564,7 @@ exit 99
             .unwrap();
         success(output);
         assert!(!image.exists());
+        assert!(!legacy.exists());
         assert!(unrelated.exists());
         assert!(
             nested_file.exists(),
@@ -1403,6 +1597,15 @@ exit 99
             count,
             "failed download leaked a temp file"
         );
+        let output = home
+            .command()
+            .arg(&helper)
+            .env("PATH", &fake_path)
+            .env("FAKE_EMPTY_IMAGE", "1")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(std::fs::read_dir(cache).unwrap().count(), count);
         for tool in ["xclip", "wl-paste"] {
             let shim = home.0.join(".local/bin").join(tool);
             // Darwin only installs the generic helper, so stage shims explicitly.

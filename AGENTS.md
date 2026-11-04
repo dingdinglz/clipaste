@@ -30,8 +30,13 @@ source with `cargo install --path . --locked`.
   explicitly opts into indefinite retention. Cleanup runs at startup and every
   approximately 60 seconds while running; HTTP must reject expired images even
   before cleanup. Do not promise secure erasure or cleanup while stopped.
-- Only `/health` is unauthenticated. Clipboard type and bytes require the private
-  bearer token. A healthy bridge diagnosis includes an authenticated probe.
+- Only `/health` is unauthenticated. Clipboard type, image bytes and Markdown
+  file bytes require the private bearer token. A healthy bridge diagnosis
+  includes an authenticated probe. Image/file endpoints must never mix types.
+- Mac file-copy capture supports PNG/TIFF/BMP/JPG/JPEG and UTF-8 `.md` files;
+  Markdown stays a file (4 MiB maximum, no NUL). Never execute or render it.
+  Native Control+V is image-only; Markdown uses the `clipaste-paste` remote path.
+  Do not auto-capture ordinary copied text or claim Windows/Linux file capture.
 - SSH setup transfers the token via stdin and installs helpers which read their
   private token file. WSL first-time setup needs `--token-file PATH` importing a
   private token copy; there is no public token-discovery endpoint.
@@ -42,7 +47,7 @@ source with `cargo install --path . --locked`.
 
 - `src/main.rs`: command-line dispatch and safe defaults.
 - `src/security.rs`: private credential lifecycle and authenticated curl.
-- `src/server.rs`: bounded loopback HTTP, metadata and authenticated images.
+- `src/server.rs`: bounded loopback HTTP, metadata and authenticated images/files.
 - `src/common.rs`: image validation, private cache, TTL and shared utilities.
 - `src/ssh_setup.rs`: safe SSH config, generated shell, WSL setup.
 - `src/doctor.rs`: role classification and diagnostics.

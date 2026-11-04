@@ -15,9 +15,28 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_MARKDOWN_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClipboardKind {
+    Image,
+    Markdown,
+}
+
+pub fn clipboard_kind(path: &Path) -> Option<ClipboardKind> {
+    match path.extension()?.to_str()? {
+        "png" => Some(ClipboardKind::Image),
+        "md" => Some(ClipboardKind::Markdown),
+        _ => None,
+    }
+}
+
+pub fn validate_markdown(bytes: &[u8]) -> bool {
+    bytes.len() <= MAX_MARKDOWN_BYTES && !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
+}
 static CACHE_IO: Mutex<()> = Mutex::new(());
 
-pub const VERSION: &str = "2.6.1-dingdinglz.1";
+pub const VERSION: &str = "2.6.1-dingdinglz.2";
 pub const DEFAULT_PORT: u16 = 18340;
 
 pub fn supports_clipboard_host(os: &str) -> bool {
@@ -34,7 +53,7 @@ pub fn unsupported_host_message(os: &str) -> String {
     )
 }
 
-/// Shared state: path to the most recently saved screenshot PNG
+/// Shared state: path to the most recently saved private PNG or Markdown file.
 pub type LatestImage = Arc<Mutex<Option<PathBuf>>>;
 
 pub fn temp_dir() -> PathBuf {
@@ -192,6 +211,19 @@ pub fn save_png_to_temp(png_data: &[u8]) -> Option<PathBuf> {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub fn save_markdown_to_temp(bytes: &[u8]) -> Option<PathBuf> {
+    match ensure_temp_dir()
+        .and_then(|()| save_cache_in_dir(&temp_dir(), bytes, ClipboardKind::Markdown))
+    {
+        Ok(path) => Some(path),
+        Err(e) => {
+            log(&format!("failed to save cached Markdown: {e}"));
+            None
+        }
+    }
+}
+
 fn verify_cached_png(path: &Path, png_data: &[u8]) -> io::Result<()> {
     if !fs::symlink_metadata(path)?.file_type().is_file() {
         return Err(io::Error::other("PNG cache entry must be a regular file"));
@@ -296,15 +328,27 @@ fn publish_staged_png(staged: &Path, path: &Path, png_data: &[u8]) -> io::Result
 }
 
 fn save_png_in_dir(dir: &Path, png_data: &[u8]) -> io::Result<PathBuf> {
-    if !validate_png(png_data) {
+    save_cache_in_dir(dir, png_data, ClipboardKind::Image)
+}
+
+fn save_cache_in_dir(dir: &Path, png_data: &[u8], kind: ClipboardKind) -> io::Result<PathBuf> {
+    let valid = match kind {
+        ClipboardKind::Image => validate_png(png_data),
+        ClipboardKind::Markdown => validate_markdown(png_data),
+    };
+    if !valid {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "Invalid or oversized PNG",
+            "Invalid or oversized cache content",
         ));
     }
     let _io = CACHE_IO.lock().unwrap();
     ensure_cache_dir(dir)?;
-    let path = dir.join(png_cache_name(png_data));
+    let name = match kind {
+        ClipboardKind::Image => png_cache_name(png_data),
+        ClipboardKind::Markdown => format!("doc-sha256-{:x}.md", Sha256::digest(png_data)),
+    };
+    let path = dir.join(name);
     match verify_cached_png(&path, png_data) {
         Ok(()) => return Ok(path),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -371,7 +415,11 @@ fn image_is_fresh_at(path: &Path, ttl: Option<Duration>, now: SystemTime) -> boo
     let Ok(meta) = fs::symlink_metadata(path) else {
         return false;
     };
-    if !meta.file_type().is_file() || meta.len() > MAX_IMAGE_BYTES as u64 {
+    let limit = match clipboard_kind(path) {
+        Some(ClipboardKind::Markdown) => MAX_MARKDOWN_BYTES,
+        _ => MAX_IMAGE_BYTES,
+    };
+    if !meta.file_type().is_file() || meta.len() > limit as u64 {
         return false;
     }
     #[cfg(unix)]
@@ -395,6 +443,12 @@ pub fn cached_image_is_fresh(path: &Path) -> bool {
 fn managed_cache_name(name: &str) -> bool {
     fn digits(value: &str) -> bool {
         !value.is_empty() && value.bytes().all(|c| c.is_ascii_digit())
+    }
+    if let Some(hash) = name
+        .strip_prefix("doc-sha256-")
+        .and_then(|s| s.strip_suffix(".md"))
+    {
+        return hash.len() == 64 && hash.bytes().all(|c| c.is_ascii_hexdigit());
     }
     if let Some(hash) = name
         .strip_prefix("shot-sha256-")
@@ -563,12 +617,35 @@ pub fn tiff_to_png(tiff_data: &[u8]) -> Option<Vec<u8>> {
     encode_png(decode_bounded(tiff_data, ImageFormat::Tiff)?)
 }
 
+#[cfg(any(target_os = "macos", test))]
+pub fn jpeg_to_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    encode_png(decode_bounded(bytes, ImageFormat::Jpeg)?)
+}
+
+/// Read only an explicit Markdown file, preserving its exact UTF-8 bytes.
+#[cfg(any(target_os = "macos", test))]
+pub fn markdown_file_bytes(path: &Path) -> Option<Vec<u8>> {
+    if !path.extension()?.to_str()?.eq_ignore_ascii_case("md") {
+        return None;
+    }
+    let file = open_regular_file(path, false).ok()?;
+    if file.metadata().ok()?.len() > MAX_MARKDOWN_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_MARKDOWN_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    validate_markdown(&bytes).then_some(bytes)
+}
+
 /// Extension selects a decoder, never a trust decision. Reject links and bound
 /// both the source read and the decoder before publishing any clipboard file.
 #[cfg(any(target_os = "macos", test))]
 pub fn image_file_to_png(path: &Path) -> Option<Vec<u8>> {
     let format = match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "png" => ImageFormat::Png,
+        "jpg" | "jpeg" => ImageFormat::Jpeg,
         "tif" | "tiff" => ImageFormat::Tiff,
         "bmp" => ImageFormat::Bmp,
         _ => return None,
@@ -660,6 +737,9 @@ WHAT IT DOES
           Images expire after one hour; cleanup runs at startup and every
           minute while running. CLIPASTE_CACHE_TTL_SECONDS=0 opts into
           indefinite retention. Deletion is not secure erasure.
+          Mac copied files support PNG/TIFF/BMP/JPG/JPEG and UTF-8 .md.
+          Markdown is limited to 4 MiB; run clipaste-paste on the remote
+          and give its .md path to Claude (Control+V remains image-only).
           Linux reads image/png without modifying the clipboard.
 
   SSH:    Runs a loopback HTTP server on port {DEFAULT_PORT}. Clipboard
@@ -729,6 +809,113 @@ mod cache_tests {
             .write_image(&[value, 0, 0, 255], 1, 1, image::ExtendedColorType::Rgba8)
             .unwrap();
         bytes
+    }
+
+    #[test]
+    fn jpeg_files_decode_to_png_and_misleading_extensions_fail() {
+        let dir = TestDir::new();
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode(&[12, 34, 56], 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        assert!(validate_png(&jpeg_to_png(&jpeg).unwrap()));
+        for ext in ["jpg", "jpeg", "JPG", "JPEG"] {
+            let path = dir.0.join(format!("input.{ext}"));
+            fs::write(&path, &jpeg).unwrap();
+            assert!(validate_png(&image_file_to_png(&path).unwrap()));
+            fs::write(&path, png(1)).unwrap();
+            assert!(image_file_to_png(&path).is_none());
+            fs::write(&path, b"binary\0garbage").unwrap();
+            assert!(image_file_to_png(&path).is_none());
+        }
+        #[cfg(unix)]
+        {
+            let original = dir.0.join("original.jpeg");
+            let link = dir.0.join("link.jpg");
+            fs::write(&original, &jpeg).unwrap();
+            std::os::unix::fs::symlink(&original, &link).unwrap();
+            assert!(image_file_to_png(&link).is_none());
+        }
+    }
+
+    #[test]
+    fn markdown_exact_roundtrip_validation_and_retention() {
+        assert!(validate_markdown(&vec![b'a'; MAX_MARKDOWN_BYTES]));
+        let dir = TestDir::new();
+        let source = dir.0.join("source.MD");
+        let cache = dir.0.join("cache");
+        for bytes in [
+            b"".as_slice(),
+            "# 标题\r\n\n<script>not executed</script>\n".as_bytes(),
+        ] {
+            fs::write(&source, bytes).unwrap();
+            assert_eq!(markdown_file_bytes(&source).unwrap(), bytes);
+            let path = save_cache_in_dir(&cache, bytes, ClipboardKind::Markdown).unwrap();
+            assert_eq!(clipboard_kind(&path), Some(ClipboardKind::Markdown));
+            assert!(path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("doc-sha256-"));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            set_mtime(&path, SystemTime::UNIX_EPOCH);
+            assert_eq!(
+                save_cache_in_dir(&cache, bytes, ClipboardKind::Markdown).unwrap(),
+                path
+            );
+            assert!(fs::metadata(&path).unwrap().modified().unwrap() > SystemTime::UNIX_EPOCH);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+                assert_eq!(
+                    fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            set_mtime(&path, SystemTime::UNIX_EPOCH);
+            let latest = LatestImage::new(Mutex::new(Some(path.clone())));
+            cleanup_cache_at(
+                &cache,
+                &latest,
+                Some(Duration::from_secs(1)),
+                SystemTime::now(),
+            )
+            .unwrap();
+            assert!(latest.lock().unwrap().is_none());
+            assert!(!path.exists());
+        }
+        for bytes in [
+            vec![0xff],
+            b"a\0b".to_vec(),
+            vec![b'a'; MAX_MARKDOWN_BYTES + 1],
+        ] {
+            fs::write(&source, &bytes).unwrap();
+            assert!(!validate_markdown(&bytes));
+            assert!(markdown_file_bytes(&source).is_none());
+            assert!(save_cache_in_dir(&cache, &bytes, ClipboardKind::Markdown).is_err());
+        }
+        let oversized = cache.join(format!("doc-sha256-{}.md", "a".repeat(64)));
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_MARKDOWN_BYTES as u64 + 1)
+            .unwrap();
+        assert!(!image_is_fresh_at(&oversized, None, SystemTime::now()));
+        assert!(!managed_cache_name("doc-sha256-short.md"));
+        assert!(!managed_cache_name(&format!(
+            "doc-sha256-{}.md",
+            "z".repeat(64)
+        )));
+        #[cfg(unix)]
+        {
+            let link = dir.0.join("link.md");
+            std::os::unix::fs::symlink(&source, &link).unwrap();
+            assert!(markdown_file_bytes(&link).is_none());
+        }
     }
 
     #[test]
