@@ -1,6 +1,6 @@
 [package]
 name = "clipaste"
-version = "2.6.1-dingdinglz.2"
+version = "2.6.1-dingdinglz.3"
 edition = "2021"
 description = "Bridge clipboard images and Markdown files to remote terminal AI tools"
 license = "MIT"

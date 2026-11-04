@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 
 const MAX_HEADERS: usize = 8192;
 const MAX_CONNECTIONS: usize = 16;
-const IO_TIMEOUT: Duration = Duration::from_secs(3);
+const HEADER_TIMEOUT: Duration = Duration::from_secs(3);
+// Authenticated payloads can cross a slow SSH link. This is an overall
+// deadline, not a per-write timer that could be extended indefinitely.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// The listener never leaves loopback. A token is required even through SSH:
 /// loopback TCP is shared by all accounts on the remote machine.
@@ -253,7 +256,7 @@ fn route(request: Request<'_>, latest: &LatestImage, server_only: bool, token: &
 fn read_headers(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
-    let deadline = Instant::now() + IO_TIMEOUT;
+    let deadline = Instant::now() + HEADER_TIMEOUT;
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -275,9 +278,49 @@ fn read_headers(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     }
 }
 
+fn response_timeout(response: &Response) -> Duration {
+    if response.status == 200
+        && matches!(
+            response.content_type,
+            "image/png" | "text/markdown; charset=utf-8"
+        )
+    {
+        TRANSFER_TIMEOUT
+    } else {
+        HEADER_TIMEOUT
+    }
+}
+
+fn write_until<W: Write>(
+    writer: &mut W,
+    mut bytes: &[u8],
+    deadline: Instant,
+    mut set_timeout: impl FnMut(&mut W, Duration) -> io::Result<()>,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "response deadline"))?;
+        set_timeout(writer, remaining)?;
+        match writer.write(&bytes[..bytes.len().min(64 * 1024)]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "response write stalled",
+                ))
+            }
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 fn handle_request(mut stream: TcpStream, latest: LatestImage, server_only: bool, token: &str) {
-    if stream.set_read_timeout(Some(IO_TIMEOUT)).is_err()
-        || stream.set_write_timeout(Some(IO_TIMEOUT)).is_err()
+    if stream.set_read_timeout(Some(HEADER_TIMEOUT)).is_err()
+        || stream.set_write_timeout(Some(HEADER_TIMEOUT)).is_err()
     {
         return;
     }
@@ -307,8 +350,10 @@ fn handle_request(mut stream: TcpStream, latest: LatestImage, server_only: bool,
         "HTTP/1.1 {} {status_text}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n{auth}Connection: close\r\n\r\n",
         response.status, response.content_type, response.body.len()
     );
-    if stream.write_all(header.as_bytes()).is_ok() {
-        let _ = stream.write_all(&response.body);
+    let deadline = Instant::now() + response_timeout(&response);
+    let timeout = |socket: &mut TcpStream, remaining| socket.set_write_timeout(Some(remaining));
+    if write_until(&mut stream, header.as_bytes(), deadline, timeout).is_ok() {
+        let _ = write_until(&mut stream, &response.body, deadline, timeout);
     }
 }
 
@@ -542,6 +587,67 @@ mod tests {
         );
         assert!(latest.lock().unwrap().is_none());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn long_transfers_do_not_relax_unauthenticated_request_limits() {
+        for content_type in ["image/png", "text/markdown; charset=utf-8"] {
+            assert_eq!(
+                response_timeout(&Response::new(200, content_type, vec![])),
+                Duration::from_secs(180)
+            );
+        }
+        for status in [200, 401, 404] {
+            assert_eq!(
+                response_timeout(&Response::new(status, "application/json", vec![])),
+                HEADER_TIMEOUT
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_response_writes_handle_partial_writes_and_a_single_deadline() {
+        struct Partial {
+            bytes: Vec<u8>,
+            calls: usize,
+        }
+        impl Write for Partial {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                let n = bytes.len().min(7);
+                self.bytes.extend_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let payload = vec![b'x'; 65537];
+        let mut writer = Partial {
+            bytes: vec![],
+            calls: 0,
+        };
+        let deadline = Instant::now() + TRANSFER_TIMEOUT;
+        let mut previous = TRANSFER_TIMEOUT;
+        write_until(&mut writer, &payload, deadline, |_, remaining| {
+            assert!(remaining <= previous);
+            assert!(remaining > HEADER_TIMEOUT);
+            previous = remaining;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(writer.bytes, payload);
+        assert!(writer.calls > 1);
+        let calls = writer.calls;
+        let error = write_until(
+            &mut writer,
+            b"not sent",
+            Instant::now() - Duration::from_secs(1),
+            |_, _| panic!("deadline must be checked before writing"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(writer.calls, calls);
     }
 
     #[test]

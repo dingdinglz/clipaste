@@ -62,10 +62,14 @@ clipaste_load_token() {
     [ -d "$d" ] && [ -O "$d" ] && [ "$(clipaste_mode "$d")" = 700 ] || clipaste_die 'missing or unsafe token directory; rerun setup'
     clipaste_read_token "$d/token"
 }
-clipaste_curl() {
+clipaste_request() {
+    local timeout="$1"
+    shift
     printf 'header = "Authorization: Bearer %s"\n' "$clipaste_token" |
-        curl -q --config - --noproxy '*' --connect-timeout 2 --max-time 10 --fail --silent "$@"
+        curl -q --config - --noproxy '*' --connect-timeout 2 --max-time "$timeout" --fail --silent "$@"
 }
+clipaste_curl() { clipaste_request 10 "$@"; }
+clipaste_transfer() { clipaste_request 180 "$@"; }
 clipaste_type() {
     clipaste_load_token
     local body
@@ -105,7 +109,7 @@ clipaste_fetch() {
     rm -f "$clipaste_reservation" || clipaste_die 'cannot release filename reservation'
     clipaste_reservation=''
     chmod 600 "$clipaste_tmp" || clipaste_die 'cannot secure download'
-    status=$(clipaste_curl --max-filesize "$limit" --write-out '%{http_code}' -o "$clipaste_tmp" "$CLIPASTE_URL/clipboard/$endpoint") || clipaste_die 'clipboard fetch failed (no native fallback)'
+    status=$(clipaste_transfer --max-filesize "$limit" --write-out '%{http_code}' -o "$clipaste_tmp" "$CLIPASTE_URL/clipboard/$endpoint") || clipaste_die 'clipboard fetch failed (no native fallback)'
     [ "$status" = 200 ] || clipaste_die 'clipboard changed or expired (no native fallback)'
     [ "$(clipaste_size "$clipaste_tmp")" -le "$limit" ] || clipaste_die 'clipboard download too large'
     if [ "$clipaste_kind" = image ]; then
@@ -1577,7 +1581,7 @@ esac
         let argv = std::fs::read_to_string(home.0.join("curl-argv")).unwrap();
         assert!(argv.starts_with("<-q>\n<--config>\n<->\n"));
         assert!(argv.contains("<--noproxy>\n<*>\n"));
-        assert!(argv.contains("<--connect-timeout>\n<2>\n<--max-time>\n<10>\n"));
+        assert!(argv.contains("<--connect-timeout>\n<2>\n<--max-time>\n<180>\n"));
         assert!(!argv.contains(TOKEN));
         assert_eq!(
             std::fs::read_to_string(home.0.join("curl-stdin")).unwrap(),
@@ -1628,6 +1632,11 @@ esac
                     .output()
                     .unwrap();
                 assert_eq!(out.status.success(), kind == "empty");
+                let metadata_argv = std::fs::read_to_string(home.0.join("curl-argv")).unwrap();
+                assert!(
+                    metadata_argv.contains("<--max-time>\n<10>\n"),
+                    "metadata queries must keep their short timeout"
+                );
                 assert_eq!(
                     String::from_utf8_lossy(&out.stdout),
                     if kind == "empty" {

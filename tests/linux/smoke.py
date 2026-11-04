@@ -1,5 +1,6 @@
 """Opt-in tests: run only in an isolated Xvfb/headless Wayland desktop."""
 
+import http.server
 import io
 import json
 import os
@@ -8,6 +9,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -72,6 +74,55 @@ def stop(proc):
     proc.wait(timeout=5)
 
 
+def verify_slow_download(consumer_env, helper, expected):
+    # A second Linux loopback address uses the same port/protocol without
+    # interfering with the daemon. No user clipboard or external server involved.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    class SlowProxy(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass  # Never log Authorization or clipboard bytes.
+
+        def do_GET(self):
+            if self.path not in ['/health', '/clipboard/type', '/clipboard/image']:
+                self.send_error(404)
+                return
+            headers = {}
+            if self.headers.get('Authorization'):
+                headers['Authorization'] = self.headers['Authorization']
+            request = urllib.request.Request(base + self.path, headers=headers)
+            with opener.open(request, timeout=3) as response:
+                data = response.read()
+                self.send_response(response.status)
+                self.send_header('Content-Type', response.headers['Content-Type'])
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                if self.path == '/clipboard/image':
+                    time.sleep(12)  # Must exceed the former curl --max-time 10.
+                self.wfile.write(data)
+
+    proxy = http.server.ThreadingHTTPServer(('127.0.0.2', 18340), SlowProxy)
+    thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+    thread.start()
+    try:
+        setup = subprocess.run([binary, 'wsl-setup', '--host', '127.0.0.2',
+                                '--token-file', str(token_file)],
+                               env=consumer_env, capture_output=True, timeout=15)
+        assert setup.returncode == 0, setup.stderr
+        start = time.monotonic()
+        fetched = subprocess.check_output([str(helper)], env=consumer_env, timeout=30)
+        assert time.monotonic() - start >= 10, 'slow transfer was not exercised'
+        assert Path(fetched.decode().strip()).read_bytes() == expected
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+        thread.join(timeout=3)
+    restore = subprocess.run([binary, 'wsl-setup', '--host', '127.0.0.1',
+                              '--token-file', str(token_file)],
+                             env=consumer_env, capture_output=True, timeout=15)
+    assert restore.returncode == 0, restore.stderr
+
+
 with tempfile.TemporaryDirectory(prefix="clipaste-smoke-") as temp:
     env = dict(os.environ, HOME=temp, XDG_CACHE_HOME=temp + "/cache",
                XDG_CONFIG_HOME=temp + "/config", CLIPASTE_BACKEND=mode,
@@ -123,6 +174,7 @@ with tempfile.TemporaryDirectory(prefix="clipaste-smoke-") as temp:
         helper = consumer_home / ".local/bin/clipaste-paste"
         fetched = subprocess.check_output([str(helper)], env=consumer_env, timeout=10)
         assert Path(fetched.decode().strip()).read_bytes() == first
+        verify_slow_download(consumer_env, helper, first)
         # The host must bypass these generated HTTP shims even if they precede
         # system tools on PATH, or the next copy would read its own cached PNG.
         stop(daemon)
@@ -189,7 +241,7 @@ with tempfile.TemporaryDirectory(prefix="clipaste-smoke-") as temp:
             wait_for(lambda: get("/clipboard/image") == (200, first), "empty startup recovery")
         print(f"{mode}: startup, HTTP, doctor, port conflict, replacement, text clearing, "
               "deduplication, cache permissions, consumer helper, shim bypass "
-              "and clipboard preservation passed")
+              "delayed authenticated downloads and clipboard preservation passed")
     except BaseException:
         log.flush()
         log.seek(0)

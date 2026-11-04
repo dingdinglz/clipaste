@@ -78,7 +78,12 @@ filenames do not become shell commands or remote output paths. `/clipboard/image
 never returns Markdown; `/clipboard/file` only returns Markdown, preventing type
 confusion with image consumers. Old helpers fail closed on the new file type.
 The recipient agent must treat document contents as data, not trusted commands.
-HTTP workers, header sizes and I/O waits are bounded. These are defenses in depth,
+HTTP workers, header sizes and I/O waits are bounded. Request headers and small
+responses retain a 3-second deadline. Only authenticated image/Markdown payload
+responses get a 180-second overall write deadline; helper downloads use the same
+180-second budget while metadata queries retain 10 seconds. This permits slow
+SSH transfers without granting unauthenticated clients long-lived payload slots.
+These are defenses in depth,
 not protection against a hostile process already executing as your user.
 
 ## Setup safety and migration

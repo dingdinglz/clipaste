@@ -123,46 +123,34 @@ fn read_png_data(pb: &NSPasteboard) -> Option<Vec<u8>> {
     None
 }
 
-/// Minimal percent-decoding for file URLs (e.g. `%20` → space).
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(h), Some(l)) = (hi, lo) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
-            }
+/// Finder may publish a file ID (`file:///.file/id=...`) rather than a path.
+/// Foundation resolves that ID and percent-encoding without guessing filenames.
+fn resolve_clipboard_file_path(raw: &str) -> Option<std::path::PathBuf> {
+    let path = if raw.starts_with("file://") {
+        let url = NSURL::URLWithString(&NSString::from_str(raw))?;
+        if !url.isFileURL()
+            || url.host().is_some_and(|host| {
+                let host = host.to_string();
+                !host.is_empty() && !host.eq_ignore_ascii_case("localhost")
+            })
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return None;
         }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
+        url.filePathURL()?.path()?.to_string()
+    } else {
+        raw.to_string()
+    };
+    let path = std::path::PathBuf::from(path);
+    path.is_absolute().then_some(path)
 }
 
 /// Accept only explicit copied files with supported image or Markdown extensions.
 fn supported_file_url_on_clipboard(pb: &NSPasteboard) -> Option<std::path::PathBuf> {
     let data = pb.dataForType(&file_url_type())?;
     let raw = String::from_utf8(data.to_vec()).ok()?;
-    let raw = raw.trim();
-    let path = if let Some(rest) = raw.strip_prefix("file://localhost/") {
-        percent_decode(&format!("/{rest}"))
-    } else if let Some(rest) = raw.strip_prefix("file://") {
-        if !rest.starts_with('/') {
-            return None;
-        }
-        percent_decode(rest)
-    } else {
-        raw.to_string()
-    };
-    if !std::path::Path::new(&path).is_absolute() {
-        return None;
-    }
-    let pb_path = std::path::PathBuf::from(path);
+    let pb_path = resolve_clipboard_file_path(raw.trim())?;
     let ext = pb_path.extension()?.to_str()?.to_lowercase();
     let is_supported_image = matches!(
         ext.as_str(),
@@ -804,6 +792,84 @@ mod tests {
             assert!(latest.lock().unwrap().is_none());
             assert_ne!(last, pb.changeCount());
         }
+    }
+
+    #[test]
+    fn finder_file_reference_urls_capture_markdown_and_images() {
+        for markdown in [false, true] {
+            let mut source = TestImage::new();
+            if markdown {
+                let path = source.0.with_extension("带 空格.md");
+                std::fs::rename(&source.0, &path).unwrap();
+                source.0 = path;
+                std::fs::write(&source.0, "# Finder 文件\r\n").unwrap();
+            }
+            let pb = test_board();
+            let url = NSURL::fileURLWithPath(&NSString::from_str(&source.0.to_string_lossy()));
+            let reference = url
+                .fileReferenceURL()
+                .expect("temporary fixture has a file ID");
+            assert!(reference.isFileReferenceURL());
+            pb.setString_forType(&reference.absoluteString().unwrap(), &file_url_type());
+            let latest = Arc::new(Mutex::new(None));
+            poll_clipboard_with_save(&pb, &latest, &mut -1, true, |kind, bytes| {
+                let expected = if markdown {
+                    common::ClipboardKind::Markdown
+                } else {
+                    common::ClipboardKind::Image
+                };
+                assert_eq!(kind, expected);
+                if markdown {
+                    assert_eq!(bytes, "# Finder 文件\r\n".as_bytes());
+                } else {
+                    assert!(common::validate_png(bytes));
+                }
+                Some(
+                    if markdown {
+                        "test-cache.md"
+                    } else {
+                        "test-cache.png"
+                    }
+                    .into(),
+                )
+            });
+            assert!(
+                latest.lock().unwrap().is_some(),
+                "Finder file-reference URL was ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn clipboard_file_urls_stay_local_and_do_not_follow_final_symlinks() {
+        for raw in [
+            "file://remote.example/tmp/document.md",
+            "https://localhost/tmp/document.md",
+            "relative.md",
+            "file:///tmp/document.md?download=true",
+            "file:///tmp/document.md#fragment",
+        ] {
+            assert!(resolve_clipboard_file_path(raw).is_none(), "accepted {raw}");
+        }
+        let source = TestImage::new();
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&source.0.to_string_lossy()));
+        let localhost =
+            url.absoluteString()
+                .unwrap()
+                .to_string()
+                .replacen("file://", "file://localhost", 1);
+        let path = resolve_clipboard_file_path(&localhost).unwrap();
+        assert_eq!(
+            path.canonicalize().unwrap(),
+            source.0.canonicalize().unwrap()
+        );
+
+        let link = TestImage::new();
+        std::fs::remove_file(&link.0).unwrap();
+        std::os::unix::fs::symlink(&source.0, &link.0).unwrap();
+        let pb = file_board(&link.0);
+        assert!(supported_file_url_on_clipboard(&pb).is_none());
+        assert!(source.0.exists());
     }
 
     #[test]

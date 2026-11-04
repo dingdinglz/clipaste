@@ -36,7 +36,7 @@ pub fn validate_markdown(bytes: &[u8]) -> bool {
 }
 static CACHE_IO: Mutex<()> = Mutex::new(());
 
-pub const VERSION: &str = "2.6.1-dingdinglz.2";
+pub const VERSION: &str = "2.6.1-dingdinglz.3";
 pub const DEFAULT_PORT: u16 = 18340;
 
 pub fn supports_clipboard_host(os: &str) -> bool {

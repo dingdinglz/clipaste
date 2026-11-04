@@ -29,6 +29,10 @@ captured. Windows/Linux clipboard hosts retain image-only capture.
 After upgrading the daemon, rerun ssh-setup and reconnect to update helpers.
 /clipboard/file only returns Markdown; /clipboard/image never returns Markdown.
 Both require authentication and obey cache expiry. Never execute file contents.
+Finder file-ID URLs are resolved with macOS Foundation before type detection.
+Payload downloads and authenticated server writes allow 180 seconds overall;
+metadata requests retain 10 seconds, request headers 3 seconds. Upgrade and restart
+the local daemon, then rerun ssh-setup to update remote helpers for slow SSH fixes.
 
 WSL setup imports the Windows credential explicitly with --token-file PATH.
 Keep token copies private (Unix0600) and use literal IP addresses for --host.

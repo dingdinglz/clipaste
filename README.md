@@ -76,7 +76,9 @@ Images are limited to 64 MiB; Markdown files to 4 MiB. Symlinks, multiple-file
 copies, private-marked clipboard entries and unsupported formats are rejected.
 The new copied-file formats are captured on **macOS**; Windows/Linux clipboard
 hosts retain their existing image-only capture behavior. Plain copied text is
-not automatically turned into an uploaded Markdown file.
+not automatically turned into an uploaded Markdown file. Finder's file-reference
+URLs (`file:///.file/id=…`) are resolved through macOS before checking the real
+filename and extension; ordinary file URLs and Unicode filenames are supported.
 
 **Markdown does not use Claude Code's image-only Control+V binding.** Copy the
 `.md` file in Finder, run `clipaste-paste` on the remote, then paste the printed
@@ -119,6 +121,22 @@ next helper invocation after one hour; they are not removed by a system timer.
 Keep your desktop user and server account trusted. A remote administrator, or
 another process running as your remote Unix account, can still use its token.
 This is not a sandbox against those actors.
+
+## Large images and slow SSH connections
+
+Image/Markdown downloads have a **180-second overall deadline**, separate from
+short metadata requests (10 seconds) and request-header validation (3 seconds).
+The server also allows 180 seconds for an authenticated payload response, so a
+slow SSH connection does not get cut off after a few seconds. Limits remain
+64 MiB per image and 4 MiB per Markdown file; no silent image downscaling is done.
+
+Claude Code's “no image over SSH” message can indicate a failed clipboard read,
+not an unsupported image type. If native paste still fails, run `clipaste-paste`
+on the remote and give its printed path to Claude. Transfers that cannot finish
+within 180 seconds still fail cleanly rather than wait indefinitely.
+
+After upgrading, restart the **local daemon** and rerun `ssh-setup` to update the
+**remote helpers**; changing only one side does not update both timeout limits.
 
 ## Upgrade after adding file support
 
