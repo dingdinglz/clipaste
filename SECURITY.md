@@ -18,7 +18,7 @@ unauthenticated upstream clipboard helpers.
 Other accounts that merely reach the remote loopback port no longer get
 unauthenticated clipboard access. However, an administrator/root, an attacker
 running as your desktop/remote account, or a process that can read its credential
-is **inside the trust boundary**. A configured server may read each staged image
+is **inside the trust boundary**. A configured server may read each staged image/file
 while connected; access is not restricted to a user pressing paste.
 
 All configured remotes share the desktop daemon's credential. Compromising one
@@ -47,17 +47,17 @@ To revoke a credential, stop the daemon, remove its token file, restart it, and
 rerun setup for every trusted remote. Remove obsolete remote token copies and
 managed SSH blocks. Do not post a token in an issue or paste it into Claude.
 
-## Image and Markdown handling and retention
+## Image and document handling and retention
 
 The fork leaves the local clipboard unchanged by default. It still automatically
 observes qualifying images and stores them in its private cache. This is not an
-explicit-send-only tool. Copied image/Markdown files and raw image bytes respect
+explicit-send-only tool. Copied image/Markdown/PDF files and raw image bytes respect
 the recognized privacy markers; arbitrary applications need not supply them.
-On macOS, copying a single `.md` file in Finder automatically stages that file;
+On macOS, copying a single `.md` or `.pdf` file in Finder automatically stages that file;
 ordinary copied text is not captured. Treat copied private documents accordingly.
 Only supported regular non-symlink files are accepted.
 
-Images and Markdown files expire after 3600 seconds by default. They become unavailable over HTTP
+Images, Markdown and PDF files expire after 3600 seconds by default. They become unavailable over HTTP
 when expired, and regular managed cache files are deleted at startup and at
 approximately 60-second intervals while the daemon runs. This is deletion, **not
 secure erasure**; disk snapshots, backups and clipboard history may retain copies.
@@ -72,14 +72,22 @@ abnormally can leave files behind; no secure-erasure guarantee is made.
 
 Images (including JPEG inputs converted to PNG) are bounded to 64 MiB; image
 decoding has allocation/dimension limits. Markdown is limited to 4 MiB of valid
-UTF-8 without NUL bytes. Files preserve Markdown bytes exactly, including empty
-files; they are not parsed, rendered, executed or used as shell commands. Source
-filenames do not become shell commands or remote output paths. `/clipboard/image`
-never returns Markdown; `/clipboard/file` only returns Markdown, preventing type
-confusion with image consumers. Old helpers fail closed on the new file type.
+UTF-8 without NUL bytes. PDFs are limited to 64 MiB and checked for a `%PDF-`
+version header at the start and a trailing `%%EOF` marker (allowing trailing
+ASCII whitespace). This is only a signature check, not structural validation,
+sanitization or a guarantee that a PDF is safe to open. Embedded scripts,
+attachments and encrypted content are not inspected or removed.
+Files preserve document bytes exactly, including empty Markdown files; they are
+not parsed, rendered, executed or used as shell commands. Source filenames do
+not become shell commands or remote output paths. `/clipboard/image` never
+returns documents. New helpers use `/clipboard/file?format=md` or
+`/clipboard/file?format=pdf`, rejecting a different staged format rather than
+mislabeling bytes if the clipboard changes. The legacy `/clipboard/file` stays
+Markdown-only. All file endpoints require authentication. Old helpers fail
+closed on PDF metadata; upgrade both the daemon and remote helpers.
 The recipient agent must treat document contents as data, not trusted commands.
 HTTP workers, header sizes and I/O waits are bounded. Request headers and small
-responses retain a 3-second deadline. Only authenticated image/Markdown payload
+responses retain a 3-second deadline. Only authenticated image/Markdown/PDF payload
 responses get a 180-second overall write deadline; helper downloads use the same
 180-second budget while metadata queries retain 10 seconds. This permits slow
 SSH transfers without granting unauthenticated clients long-lived payload slots.

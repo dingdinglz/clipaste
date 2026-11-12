@@ -192,25 +192,38 @@ fn route(request: Request<'_>, latest: &LatestImage, server_only: bool, token: &
                 Some(common::ClipboardKind::Markdown) => {
                     b"{\"type\":\"file\",\"format\":\"md\"}".as_slice()
                 }
+                Some(common::ClipboardKind::Pdf) => {
+                    b"{\"type\":\"file\",\"format\":\"pdf\"}".as_slice()
+                }
                 None => b"{\"type\":\"empty\"}".as_slice(),
             };
             Response::new(200, "application/json", body.to_vec())
         }
-        "/clipboard/image" | "/clipboard/file" => {
+        "/clipboard/image"
+        | "/clipboard/file"
+        | "/clipboard/file?format=md"
+        | "/clipboard/file?format=pdf" => {
             let Some(path) = fresh_path(latest) else {
                 return Response::new(204, "text/plain", Vec::new());
             };
-            let expected = if request.path == "/clipboard/image" {
-                common::ClipboardKind::Image
-            } else {
-                common::ClipboardKind::Markdown
+            let Some(expected) = common::clipboard_kind(&path) else {
+                return Response::new(204, "text/plain", Vec::new());
             };
-            if common::clipboard_kind(&path) != Some(expected) {
+            // Pin document formats for new helpers so a clipboard change between
+            // metadata and download cannot save PDF bytes under a .md extension.
+            // The legacy file endpoint remains Markdown-only for old helpers.
+            let allowed = match request.path {
+                "/clipboard/image" => common::ClipboardKind::Image,
+                "/clipboard/file?format=pdf" => common::ClipboardKind::Pdf,
+                _ => common::ClipboardKind::Markdown,
+            };
+            if expected != allowed {
                 return Response::new(204, "text/plain", Vec::new());
             }
             let limit = match expected {
                 common::ClipboardKind::Image => common::MAX_IMAGE_BYTES as u64,
                 common::ClipboardKind::Markdown => common::MAX_MARKDOWN_BYTES as u64,
+                common::ClipboardKind::Pdf => common::MAX_PDF_BYTES as u64,
             };
             let read = || -> io::Result<Vec<u8>> {
                 let mut options = std::fs::OpenOptions::new();
@@ -234,15 +247,18 @@ fn route(request: Request<'_>, latest: &LatestImage, server_only: bool, token: &
                 {
                     return Err(io::Error::other("invalid cached Markdown"));
                 }
+                if expected == common::ClipboardKind::Pdf && !common::validate_pdf(&data) {
+                    return Err(io::Error::other("invalid cached PDF"));
+                }
                 Ok(data)
             };
             match read() {
                 Ok(data) => Response::new(
                     200,
-                    if expected == common::ClipboardKind::Image {
-                        "image/png"
-                    } else {
-                        "text/markdown; charset=utf-8"
+                    match expected {
+                        common::ClipboardKind::Image => "image/png",
+                        common::ClipboardKind::Markdown => "text/markdown; charset=utf-8",
+                        common::ClipboardKind::Pdf => "application/pdf",
                     },
                     data,
                 ),
@@ -282,7 +298,7 @@ fn response_timeout(response: &Response) -> Duration {
     if response.status == 200
         && matches!(
             response.content_type,
-            "image/png" | "text/markdown; charset=utf-8"
+            "image/png" | "text/markdown; charset=utf-8" | "application/pdf"
         )
     {
         TRANSFER_TIMEOUT
@@ -375,7 +391,13 @@ mod tests {
         assert!(String::from_utf8(health.body)
             .unwrap()
             .contains("\"auth\":\"bearer\""));
-        for path in ["/clipboard/type", "/clipboard/image", "/clipboard/file"] {
+        for path in [
+            "/clipboard/type",
+            "/clipboard/image",
+            "/clipboard/file",
+            "/clipboard/file?format=md",
+            "/clipboard/file?format=pdf",
+        ] {
             assert_eq!(response(path, "").status, 401);
             assert_eq!(
                 response(
@@ -590,8 +612,106 @@ mod tests {
     }
 
     #[test]
+    fn pdf_is_authenticated_bounded_and_format_pinned() {
+        use std::fs;
+        let dir =
+            std::env::temp_dir().join(format!("clipaste-pdf-http-test-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("document.pdf");
+        fs::write(&path, common::TEST_PDF).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let token = "a".repeat(64);
+        let latest = LatestImage::default();
+        *latest.lock().unwrap() = Some(path.clone());
+        let request = |endpoint, bearer| {
+            route(
+                Request {
+                    path: endpoint,
+                    bearer,
+                },
+                &latest,
+                true,
+                &token,
+            )
+        };
+        let endpoint = "/clipboard/file?format=pdf";
+        assert_eq!(request(endpoint, None).status, 401);
+        let wrong_token = "b".repeat(64);
+        assert_eq!(request(endpoint, Some(&wrong_token)).status, 401);
+        let file = request(endpoint, Some(&token));
+        assert_eq!(file.status, 200);
+        assert_eq!(file.content_type, "application/pdf");
+        assert_eq!(file.body, common::TEST_PDF);
+        assert_eq!(
+            request("/clipboard/type", Some(&token)).body,
+            b"{\"type\":\"file\",\"format\":\"pdf\"}"
+        );
+        for wrong in [
+            "/clipboard/image",
+            "/clipboard/file",
+            "/clipboard/file?format=md",
+        ] {
+            assert_eq!(request(wrong, Some(&token)).status, 204);
+        }
+        assert_eq!(
+            request("/clipboard/file?format=exe", Some(&token)).status,
+            404
+        );
+        let markdown = dir.join("document.md");
+        fs::write(&markdown, b"# document").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&markdown, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        *latest.lock().unwrap() = Some(markdown);
+        assert_eq!(request(endpoint, Some(&token)).status, 204);
+        assert_eq!(
+            request("/clipboard/file?format=md", Some(&token)).body,
+            b"# document"
+        );
+        *latest.lock().unwrap() = Some(path.clone());
+        fs::write(&path, b"not PDF").unwrap();
+        assert_eq!(request(endpoint, Some(&token)).status, 404);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(common::MAX_PDF_BYTES as u64 + 1)
+            .unwrap();
+        assert_eq!(request(endpoint, Some(&token)).status, 204);
+        assert!(latest.lock().unwrap().is_none());
+        fs::write(&path, common::TEST_PDF).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        *latest.lock().unwrap() = Some(path.clone());
+        assert_eq!(request(endpoint, Some(&token)).status, 204);
+        assert!(latest.lock().unwrap().is_none());
+        #[cfg(unix)]
+        {
+            let link = dir.join("link.pdf");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            *latest.lock().unwrap() = Some(link);
+            assert_eq!(request(endpoint, Some(&token)).status, 204);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn long_transfers_do_not_relax_unauthenticated_request_limits() {
-        for content_type in ["image/png", "text/markdown; charset=utf-8"] {
+        for content_type in [
+            "image/png",
+            "text/markdown; charset=utf-8",
+            "application/pdf",
+        ] {
             assert_eq!(
                 response_timeout(&Response::new(200, content_type, vec![])),
                 Duration::from_secs(180)

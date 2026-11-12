@@ -1,6 +1,6 @@
 # clipaste — hardened fork
 
-Paste local clipboard images and copied Markdown files into Claude Code over SSH. Fork of
+Paste local clipboard images and copied Markdown/PDF files into Claude Code over SSH. Fork of
 [hqhq1025/clipaste](https://github.com/hqhq1025/clipaste), maintained here at
 [dingdinglz/clipaste](https://github.com/dingdinglz/clipaste).
 
@@ -18,8 +18,8 @@ advertised; install from source.
 - The local clipboard is **left untouched by default**. SSH image paste still
   works. Explicitly set `CLIPASTE_SERVER_ONLY=0` to enable upstream-style local
   file-path paste.
-- Image and Markdown caches expire after **one hour** by default. Cleanup runs at startup and
-  approximately once per minute while the daemon runs. Expired images cannot be
+- Image, Markdown and PDF caches expire after **one hour** by default. Cleanup runs at startup and
+  approximately once per minute while the daemon runs. Expired images/files cannot be
   fetched even before the next cleanup pass.
 - SSH configuration gets a private backup and an atomic replacement. Setup adds
   narrowly scoped, managed blocks instead of parsing/rebuilding user Host/Match
@@ -71,8 +71,9 @@ For macOS, that may mean `brew services stop clipaste`. Do not restart it using
 | Mac screenshot / copied image pixels | PNG, TIFF, JPEG | PNG image; Claude Code on Linux uses Control+V |
 | One image file copied in Mac Finder | `.png`, `.tif`, `.tiff`, `.bmp`, `.jpg`, `.jpeg` (case-insensitive) | Validated and converted to PNG |
 | One file copied in Mac Finder | `.md` (UTF-8, no NUL bytes, including empty files) | Exact Markdown bytes in a private remote `.md` file |
+| One file copied in Mac Finder | `.pdf` (case-insensitive; PDF header and EOF marker required) | Exact PDF bytes in a private remote `.pdf` file |
 
-Images are limited to 64 MiB; Markdown files to 4 MiB. Symlinks, multiple-file
+Images and PDF files are limited to 64 MiB; Markdown files to 4 MiB. Symlinks, multiple-file
 copies, private-marked clipboard entries and unsupported formats are rejected.
 The new copied-file formats are captured on **macOS**; Windows/Linux clipboard
 hosts retain their existing image-only capture behavior. Plain copied text is
@@ -80,10 +81,13 @@ not automatically turned into an uploaded Markdown file. Finder's file-reference
 URLs (`file:///.file/id=…`) are resolved through macOS before checking the real
 filename and extension; ordinary file URLs and Unicode filenames are supported.
 
-**Markdown does not use Claude Code's image-only Control+V binding.** Copy the
-`.md` file in Finder, run `clipaste-paste` on the remote, then paste the printed
-remote path into Claude. You can also ask Claude to run `clipaste-paste` and read
-that path. The helper only transfers the bytes; it never executes Markdown code.
+**Markdown/PDF do not use Claude Code's image-only Control+V binding.** Copy the
+`.md` or `.pdf` file in Finder, run `clipaste-paste` on the remote, then paste the
+printed remote path into Claude. You can also ask Claude to run `clipaste-paste`
+and read that path. The helper only transfers bytes; it never parses, renders or
+executes document contents. PDF checks only verify a `%PDF-` version header and
+trailing `%%EOF` marker, not document structure or safety. PDFs are not converted
+to images; whether they can be read depends on the receiving tool.
 
 ## SSH setup: Mac → Linux Claude Code
 
@@ -114,7 +118,7 @@ Copy an image locally, then press **Control+V** in remote Claude Code on Linux.
 
 For a remote Mac, Codex CLI, or tools that read image files rather than invoking
 clipboard helpers, run `clipaste-paste` on the remote and give its printed path
-to the agent. The same helper supports copied `.md` files. Helper files are
+to the agent. The same helper supports copied `.md` and `.pdf` files. Helper files are
 private and expire through cleanup on the
 next helper invocation after one hour; they are not removed by a system timer.
 
@@ -124,11 +128,11 @@ This is not a sandbox against those actors.
 
 ## Large images and slow SSH connections
 
-Image/Markdown downloads have a **180-second overall deadline**, separate from
+Image/Markdown/PDF downloads have a **180-second overall deadline**, separate from
 short metadata requests (10 seconds) and request-header validation (3 seconds).
 The server also allows 180 seconds for an authenticated payload response, so a
 slow SSH connection does not get cut off after a few seconds. Limits remain
-64 MiB per image and 4 MiB per Markdown file; no silent image downscaling is done.
+64 MiB per image/PDF and 4 MiB per Markdown file; no silent image downscaling is done.
 
 Claude Code's “no image over SSH” message can indicate a failed clipboard read,
 not an unsupported image type. If native paste still fails, run `clipaste-paste`
@@ -148,8 +152,9 @@ cargo install --path . --locked
 
 Stop your existing foreground daemon with Control+C and restart the new binary.
 Then rerun `clipaste ssh-setup your-server` locally to update the remote helpers,
-and open a new SSH connection. Updating only the daemon is not enough for
-Markdown: old remote helpers deliberately reject unknown payload types.
+and open a new SSH connection. Upgrade both ends for PDF support: old remote
+helpers deliberately reject unknown payload types. New helpers also pin document
+formats during downloads, requiring the updated daemon for Markdown/PDF.
 
 ## WSL2
 
@@ -177,7 +182,7 @@ clipboard service publicly to work around networking limitations.
 | Variable | Default | Meaning |
 |---|---|---|
 | `CLIPASTE_SERVER_ONLY` | `1` | Leave the local clipboard unchanged; `0` opts into local path normalization |
-| `CLIPASTE_CACHE_TTL_SECONDS` | `3600` | Local image/Markdown retention; `0` explicitly opts into indefinite retention |
+| `CLIPASTE_CACHE_TTL_SECONDS` | `3600` | Local image/Markdown/PDF retention; `0` explicitly opts into indefinite retention |
 | `CLIPASTE_BACKEND` | `auto` | Linux only: `auto`, `wayland`, or `x11` |
 
 Environment settings belong to the **daemon**, not the SSH client. Clearing the

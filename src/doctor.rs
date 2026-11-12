@@ -211,6 +211,7 @@ fn clipboard_state(body: &str) -> Option<&'static str> {
     match compact.as_str() {
         "{\"type\":\"image\",\"format\":\"png\"}" => Some("image"),
         "{\"type\":\"file\",\"format\":\"md\"}" => Some("markdown"),
+        "{\"type\":\"file\",\"format\":\"pdf\"}" => Some("pdf"),
         "{\"type\":\"empty\"}" => Some("empty"),
         _ => None,
     }
@@ -452,6 +453,13 @@ fn clipboard_host_checks() -> Vec<Check> {
                     checks.push(Check::ok(
                         "clipboard",
                         "a Markdown file is staged; use clipaste-paste on the remote",
+                    ));
+                }
+                Some(body) if clipboard_state(&body) == Some("pdf") => {
+                    checks.push(Check::ok("authentication", "private credential accepted"));
+                    checks.push(Check::ok(
+                        "clipboard",
+                        "a PDF file is staged; use clipaste-paste on the remote",
                     ));
                 }
                 Some(body) if clipboard_state(&body) == Some("empty") => {
@@ -782,6 +790,10 @@ mod tests {
         assert_eq!(
             clipboard_state("{ \"type\": \"file\", \"format\": \"md\" }"),
             Some("markdown")
+        );
+        assert_eq!(
+            clipboard_state("{ \"type\": \"file\", \"format\": \"pdf\" }"),
+            Some("pdf")
         );
         assert_eq!(clipboard_state("{\"type\":\"empty\"}"), Some("empty"));
         assert_eq!(

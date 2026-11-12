@@ -16,23 +16,41 @@ use std::time::{Duration, SystemTime};
 
 pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_MARKDOWN_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_PDF_BYTES: usize = 64 * 1024 * 1024;
+
+// Synthetic binary signature fixture; PDF structure is deliberately not parsed.
+#[cfg(test)]
+pub(crate) const TEST_PDF: &[u8] = b"%PDF-1.7\n%\xff\xfe\x00\x80\n1 0 obj\n<<>>\nendobj\n%%EOF\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClipboardKind {
     Image,
     Markdown,
+    Pdf,
 }
 
 pub fn clipboard_kind(path: &Path) -> Option<ClipboardKind> {
     match path.extension()?.to_str()? {
         "png" => Some(ClipboardKind::Image),
         "md" => Some(ClipboardKind::Markdown),
+        "pdf" => Some(ClipboardKind::Pdf),
         _ => None,
     }
 }
 
 pub fn validate_markdown(bytes: &[u8]) -> bool {
     bytes.len() <= MAX_MARKDOWN_BYTES && !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
+}
+/// Bounded signature check only, not structural validation or sanitization.
+/// Keep PDF bytes opaque: never parse, render, decrypt or execute their content.
+pub fn validate_pdf(bytes: &[u8]) -> bool {
+    bytes.len() <= MAX_PDF_BYTES
+        && bytes.starts_with(b"%PDF-")
+        && bytes.get(5).is_some_and(u8::is_ascii_digit)
+        && bytes.get(6) == Some(&b'.')
+        && bytes.get(7).is_some_and(u8::is_ascii_digit)
+        && bytes.get(8).is_some_and(u8::is_ascii_whitespace)
+        && bytes.trim_ascii_end().ends_with(b"%%EOF")
 }
 static CACHE_IO: Mutex<()> = Mutex::new(());
 
@@ -53,7 +71,7 @@ pub fn unsupported_host_message(os: &str) -> String {
     )
 }
 
-/// Shared state: path to the most recently saved private PNG or Markdown file.
+/// Shared state: path to the most recently saved private PNG, Markdown or PDF file.
 pub type LatestImage = Arc<Mutex<Option<PathBuf>>>;
 
 pub fn temp_dir() -> PathBuf {
@@ -212,13 +230,11 @@ pub fn save_png_to_temp(png_data: &[u8]) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn save_markdown_to_temp(bytes: &[u8]) -> Option<PathBuf> {
-    match ensure_temp_dir()
-        .and_then(|()| save_cache_in_dir(&temp_dir(), bytes, ClipboardKind::Markdown))
-    {
+pub fn save_document_to_temp(bytes: &[u8], kind: ClipboardKind) -> Option<PathBuf> {
+    match ensure_temp_dir().and_then(|()| save_cache_in_dir(&temp_dir(), bytes, kind)) {
         Ok(path) => Some(path),
         Err(e) => {
-            log(&format!("failed to save cached Markdown: {e}"));
+            log(&format!("failed to save cached document: {e}"));
             None
         }
     }
@@ -335,6 +351,7 @@ fn save_cache_in_dir(dir: &Path, png_data: &[u8], kind: ClipboardKind) -> io::Re
     let valid = match kind {
         ClipboardKind::Image => validate_png(png_data),
         ClipboardKind::Markdown => validate_markdown(png_data),
+        ClipboardKind::Pdf => validate_pdf(png_data),
     };
     if !valid {
         return Err(io::Error::new(
@@ -347,6 +364,7 @@ fn save_cache_in_dir(dir: &Path, png_data: &[u8], kind: ClipboardKind) -> io::Re
     let name = match kind {
         ClipboardKind::Image => png_cache_name(png_data),
         ClipboardKind::Markdown => format!("doc-sha256-{:x}.md", Sha256::digest(png_data)),
+        ClipboardKind::Pdf => format!("doc-sha256-{:x}.pdf", Sha256::digest(png_data)),
     };
     let path = dir.join(name);
     match verify_cached_png(&path, png_data) {
@@ -417,6 +435,7 @@ fn image_is_fresh_at(path: &Path, ttl: Option<Duration>, now: SystemTime) -> boo
     };
     let limit = match clipboard_kind(path) {
         Some(ClipboardKind::Markdown) => MAX_MARKDOWN_BYTES,
+        Some(ClipboardKind::Pdf) => MAX_PDF_BYTES,
         _ => MAX_IMAGE_BYTES,
     };
     if !meta.file_type().is_file() || meta.len() > limit as u64 {
@@ -446,7 +465,7 @@ fn managed_cache_name(name: &str) -> bool {
     }
     if let Some(hash) = name
         .strip_prefix("doc-sha256-")
-        .and_then(|s| s.strip_suffix(".md"))
+        .and_then(|s| s.strip_suffix(".md").or_else(|| s.strip_suffix(".pdf")))
     {
         return hash.len() == 64 && hash.bytes().all(|c| c.is_ascii_hexdigit());
     }
@@ -637,6 +656,23 @@ pub fn markdown_file_bytes(path: &Path) -> Option<Vec<u8>> {
         .read_to_end(&mut bytes)
         .ok()?;
     validate_markdown(&bytes).then_some(bytes)
+}
+
+/// Read only explicit PDF files, preserving binary bytes after signature checks.
+#[cfg(any(target_os = "macos", test))]
+pub fn pdf_file_bytes(path: &Path) -> Option<Vec<u8>> {
+    if !path.extension()?.to_str()?.eq_ignore_ascii_case("pdf") {
+        return None;
+    }
+    let file = open_regular_file(path, false).ok()?;
+    if file.metadata().ok()?.len() > MAX_PDF_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_PDF_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    validate_pdf(&bytes).then_some(bytes)
 }
 
 /// Extension selects a decoder, never a trust decision. Reject links and bound
@@ -916,6 +952,98 @@ mod cache_tests {
             std::os::unix::fs::symlink(&source, &link).unwrap();
             assert!(markdown_file_bytes(&link).is_none());
         }
+    }
+
+    #[test]
+    fn pdf_files_preserve_binary_bytes_in_private_expiring_cache() {
+        let dir = TestDir::new();
+        let source = dir.0.join("报告.PdF");
+        fs::write(&source, TEST_PDF).unwrap();
+        assert_eq!(pdf_file_bytes(&source).unwrap(), TEST_PDF);
+        let cache = dir.0.join("cache");
+        let path = save_cache_in_dir(&cache, TEST_PDF, ClipboardKind::Pdf).unwrap();
+        assert_eq!(clipboard_kind(&path), Some(ClipboardKind::Pdf));
+        assert!(managed_cache_name(
+            path.file_name().unwrap().to_str().unwrap()
+        ));
+        assert_eq!(fs::read(&path).unwrap(), TEST_PDF);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let link = dir.0.join("link.pdf");
+            std::os::unix::fs::symlink(&source, &link).unwrap();
+            assert!(pdf_file_bytes(&link).is_none());
+        }
+        set_mtime(&path, SystemTime::UNIX_EPOCH);
+        assert_eq!(
+            save_cache_in_dir(&cache, TEST_PDF, ClipboardKind::Pdf).unwrap(),
+            path
+        );
+        assert!(image_is_fresh_at(
+            &path,
+            Some(Duration::from_secs(3600)),
+            SystemTime::now()
+        ));
+        set_mtime(&path, SystemTime::UNIX_EPOCH);
+        let latest = LatestImage::new(Mutex::new(Some(path.clone())));
+        cleanup_cache_at(&cache, &latest, None, SystemTime::now()).unwrap();
+        assert!(path.exists());
+        cleanup_cache_at(
+            &cache,
+            &latest,
+            Some(Duration::from_secs(1)),
+            SystemTime::now(),
+        )
+        .unwrap();
+        assert!(latest.lock().unwrap().is_none());
+        assert!(!path.exists());
+        assert!(!managed_cache_name("doc-sha256-short.pdf"));
+        assert!(!managed_cache_name(&format!(
+            "doc-sha256-{}.pdf",
+            "z".repeat(64)
+        )));
+    }
+
+    #[test]
+    fn pdf_signature_extension_and_size_are_checked_without_parsing() {
+        let dir = TestDir::new();
+        let source = dir.0.join("input.pdf");
+        for invalid in [
+            b"".as_slice(),
+            b"not PDF",
+            b"%PDF-1.7\ntruncated",
+            b"%PDF-x.y\n%%EOF",
+            b"%PDF-1.7junk\n%%EOF",
+            b"%PDF-1.7\n%%EOF\njunk",
+        ] {
+            fs::write(&source, invalid).unwrap();
+            assert!(!validate_pdf(invalid));
+            assert!(pdf_file_bytes(&source).is_none());
+            assert!(save_cache_in_dir(&dir.0.join("cache"), invalid, ClipboardKind::Pdf).is_err());
+        }
+        let wrong_ext = dir.0.join("input.txt");
+        fs::write(&wrong_ext, TEST_PDF).unwrap();
+        assert!(pdf_file_bytes(&wrong_ext).is_none());
+        assert!(pdf_file_bytes(&dir.0).is_none());
+        // Exercise the inclusive limit and bounded source read using synthetic bytes.
+        let mut boundary = b"%PDF-2.0\n".to_vec();
+        boundary.resize(MAX_PDF_BYTES - 5, 0);
+        boundary.extend_from_slice(b"%%EOF");
+        assert!(validate_pdf(&boundary));
+        boundary.push(b'\n');
+        assert!(!validate_pdf(&boundary));
+        fs::write(&source, &boundary).unwrap();
+        assert!(pdf_file_bytes(&source).is_none());
+        assert!(save_cache_in_dir(&dir.0.join("cache"), &boundary, ClipboardKind::Pdf).is_err());
+        assert!(!image_is_fresh_at(&source, None, SystemTime::now()));
     }
 
     #[test]

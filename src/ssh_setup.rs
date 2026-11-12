@@ -77,6 +77,7 @@ clipaste_type() {
     case "$body" in
         '{"type":"image","format":"png"}') clipaste_kind=image ;;
         '{"type":"file","format":"md"}') clipaste_kind=markdown ;;
+        '{"type":"file","format":"pdf"}') clipaste_kind=pdf ;;
         '{"type":"empty"}') clipaste_kind=empty ;;
         *) clipaste_die 'invalid clipboard response (no native fallback)' ;;
     esac
@@ -98,7 +99,8 @@ clipaste_fetch() {
     local ext endpoint limit status
     case "$clipaste_kind" in
         image) ext=png; endpoint=image; limit=67108864 ;;
-        markdown) ext=md; endpoint=file; limit=4194304 ;;
+        markdown) ext=md; endpoint='file?format=md'; limit=4194304 ;;
+        pdf) ext=pdf; endpoint='file?format=pdf'; limit=67108864 ;;
         *) clipaste_die 'unsupported clipboard type' ;;
     esac
     # Reserve a portable template, then publish the extension without overwrite.
@@ -140,9 +142,16 @@ case "$*" in
         clipaste_type
         if [ "$clipaste_kind" = image ]; then printf 'TARGETS\nimage/png\n'; exit 0; fi
         if [ "$clipaste_kind" = markdown ]; then printf 'TARGETS\ntext/markdown\ntext/plain\n'; exit 0; fi
+        if [ "$clipaste_kind" = pdf ]; then printf 'TARGETS\napplication/pdf\n'; exit 0; fi
+        ;;
+    *"-selection clipboard"*"-t application/pdf "*"-o"*|*"-sel clip"*"-t application/pdf "*"-o"*)
+        clipaste_type
+        [ "$clipaste_kind" = pdf ] || clipaste_die 'clipboard is not a PDF (no native fallback)'
+        clipaste_fetch; cat "$clipaste_tmp"; exit $?
         ;;
     *"-selection clipboard"*"-t image/"*"-o"*|*"-sel clip"*"-t image/"*"-o"*)
         clipaste_type
+        [ "$clipaste_kind" != pdf ] || clipaste_die 'PDF is not an image (no native fallback)'
         [ "$clipaste_kind" != markdown ] || clipaste_die 'Markdown is not an image; use clipaste-paste'
         case "$*" in
             *"-t image/png"*)
@@ -151,7 +160,12 @@ case "$*" in
         ;;
     *"-selection clipboard"*"-t text/markdown"*"-o"*|*"-sel clip"*"-t text/markdown"*"-o"*|*"-selection clipboard"*"-t text/plain"*"-o"*|*"-sel clip"*"-t text/plain"*"-o"*)
         clipaste_type
+        [ "$clipaste_kind" != pdf ] || clipaste_die 'PDF is not text (no native fallback)'
         if [ "$clipaste_kind" = markdown ]; then clipaste_fetch; cat "$clipaste_tmp"; exit $?; fi
+        ;;
+    *"-selection clipboard"*"-t text/"*"-o"*|*"-sel clip"*"-t text/"*"-o"*|*"-selection clipboard"*"-t UTF8_STRING"*"-o"*|*"-sel clip"*"-t UTF8_STRING"*"-o"*|*"-selection clipboard"*"-t STRING"*"-o"*|*"-sel clip"*"-t STRING"*"-o"*|*"-selection clipboard"*"-t TEXT"*"-o"*|*"-sel clip"*"-t TEXT"*"-o"*)
+        clipaste_type
+        [ "$clipaste_kind" != pdf ] || clipaste_die 'PDF is not text (no native fallback)'
         ;;
 esac
 clipaste_native xclip "$@"
@@ -162,22 +176,34 @@ case "$*" in
         clipaste_type
         if [ "$clipaste_kind" = image ]; then printf 'image/png\n'; exit 0; fi
         if [ "$clipaste_kind" = markdown ]; then printf 'text/markdown\ntext/plain\n'; exit 0; fi
+        if [ "$clipaste_kind" = pdf ]; then printf 'application/pdf\n'; exit 0; fi
+        ;;
+    *"--type application/pdf"|*"--type application/pdf "*|*"-t application/pdf"|*"-t application/pdf "*)
+        clipaste_type
+        [ "$clipaste_kind" = pdf ] || clipaste_die 'clipboard is not a PDF (no native fallback)'
+        clipaste_fetch; cat "$clipaste_tmp"; exit $?
         ;;
     *"--type image/"*|*"-t image/"*)
         clipaste_type
+        [ "$clipaste_kind" != pdf ] || clipaste_die 'PDF is not an image (no native fallback)'
         [ "$clipaste_kind" != markdown ] || clipaste_die 'Markdown is not an image; use clipaste-paste'
         if [ "$clipaste_kind" = image ]; then clipaste_fetch; cat "$clipaste_tmp"; exit $?; fi
         ;;
     *"--type text/markdown"*|*"-t text/markdown"*|*"--type text/plain"*|*"-t text/plain"*)
         clipaste_type
+        [ "$clipaste_kind" != pdf ] || clipaste_die 'PDF is not text (no native fallback)'
         if [ "$clipaste_kind" = markdown ]; then clipaste_fetch; cat "$clipaste_tmp"; exit $?; fi
+        ;;
+    *"--type text/"*|*"-t text/"*)
+        clipaste_type
+        [ "$clipaste_kind" != pdf ] || clipaste_die 'PDF is not text (no native fallback)'
         ;;
 esac
 clipaste_native wl-paste "$@"
 "#;
 const PASTE_BODY: &str = r#"
 clipaste_type
-[ "$clipaste_kind" != empty ] || clipaste_die 'no image or Markdown file on clipboard'
+[ "$clipaste_kind" != empty ] || clipaste_die 'no image, Markdown or PDF file on clipboard'
 clipaste_fetch
 printf '%s\n' "$clipaste_tmp"
 # The printed file stays usable for one hour; subsequent helper calls expire it.
@@ -393,6 +419,7 @@ fn valid_clipboard_type(body: &str) -> bool {
         body,
         r#"{"type":"image","format":"png"}"#
             | r#"{"type":"file","format":"md"}"#
+            | r#"{"type":"file","format":"pdf"}"#
             | r#"{"type":"empty"}"#
     )
 }
@@ -1326,38 +1353,51 @@ mod tests {
             r#"#!/bin/bash
 printf '<%s>\n' "$@" > "$HOME/curl-argv"
 cat > "$HOME/curl-stdin"
-output='' status_format='' limit='' url=''
+output='' status_format='' limit='' url='' timeout='' connect_timeout=''
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -o) output="$2"; shift ;;
         --write-out) status_format="$2"; shift ;;
         --max-filesize) limit="$2"; shift ;;
+        --max-time) timeout="$2"; shift ;;
+        --connect-timeout) connect_timeout="$2"; shift ;;
         */clipboard/*) url="$1" ;;
     esac
     shift
 done
+[ "$connect_timeout" = 2 ] || exit 96
 case "$url" in
     */clipboard/type)
+        [ "$timeout" = 10 ] || exit 96
         case "${FAKE_TYPE:-image}" in
             fail) exit 22 ;;
             empty) printf '{"type":"empty"}' ;;
             markdown) printf '{"type":"file","format":"md"}' ;;
+            pdf) printf '{"type":"file","format":"pdf"}' ;;
             malformed) printf 'bad response' ;;
             unknown) printf '{"type":"file","format":"txt"}' ;;
             *) printf '{"type":"image","format":"png"}' ;;
         esac ;;
-    */clipboard/image|*/clipboard/file)
-        [ "${FAKE_IMAGE:-ok}" = ok ] || exit 22
+    */clipboard/image|*/clipboard/file\?format=md|*/clipboard/file\?format=pdf)
+        [ "$timeout" = 180 ] || exit 96
+        case "$url" in
+            */clipboard/file\?format=md) [ "$limit" = 4194304 ] || exit 98 ;;
+            *) [ "$limit" = 67108864 ] || exit 98 ;;
+        esac
+        if [ "${FAKE_IMAGE:-ok}" != ok ]; then
+            printf 'partial download' > "$output"
+            exit 22
+        fi
         if [ "${FAKE_STATUS:-200}" = 200 ]; then
-            if [[ "$url" = */clipboard/file ]]; then
-                [ "$limit" = 4194304 ] || exit 98
+            if [[ "$url" = */clipboard/file\?format=* ]]; then
                 cat "$HOME/payload" > "$output"
             else
-                [ "$limit" = 67108864 ] || exit 98
                 if [ "${FAKE_EMPTY_IMAGE:-0}" = 1 ]; then : > "$output"; else printf 'dummy PNG' > "$output"; fi
             fi
             size=$(wc -c < "$output")
-            [ "$size" -le "$limit" ] || exit 63
+            if [ "${FAKE_IGNORE_LIMIT:-0}" != 1 ]; then
+                [ "$size" -le "$limit" ] || exit 63
+            fi
         fi
         [ "$status_format" = '%{http_code}' ] || exit 97
         printf '%s' "${FAKE_STATUS:-200}" ;;
@@ -1373,6 +1413,7 @@ esac
     fn clipboard_type_validation_is_exact() {
         for body in [
             r#"{"type":"file","format":"md"}"#,
+            r#"{"type":"file","format":"pdf"}"#,
             r#"{"type":"image","format":"png"}"#,
             r#"{"type":"empty"}"#,
         ] {
@@ -1405,7 +1446,7 @@ esac
         success(home.run(&installer));
         assert!(std::fs::read_to_string(&helper)
             .unwrap()
-            .contains("endpoint=file"));
+            .contains("endpoint='file?format=md'"));
         let fake = fake_curl(&home);
         let path = format!("{}:/usr/bin:/bin", fake.display());
         let run = |kind: &str, status: &str| {
@@ -1505,6 +1546,185 @@ esac
         success(run("markdown", "200"));
         assert!(downloads.iter().all(|file| !file.exists()));
         assert!(!home.0.join("NEVER_EXECUTE").exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn pdf_helpers_preserve_binary_bytes_and_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempHome::new();
+        success(home.run(&build_remote_setup_script(URL, TOKEN).unwrap()));
+        let fake = fake_curl(&home);
+        let path = format!("{}:/usr/bin:/bin", fake.display());
+        let helper = home.0.join(".local/bin/clipaste-paste");
+        let payload = b"%PDF-1.7\r\n%\xff\xfe\x00\x80\n$(touch NEVER_EXECUTE)\n%%EOF\r\n";
+        std::fs::write(home.0.join("payload"), payload).unwrap();
+        let run = |script: &Path, args: &[&str], kind: &str, status: &str, transfer: &str| {
+            home.command()
+                .arg(script)
+                .args(args)
+                .env("PATH", &path)
+                .env("FAKE_TYPE", kind)
+                .env("FAKE_STATUS", status)
+                .env("FAKE_IMAGE", transfer)
+                .output()
+                .unwrap()
+        };
+        let out = run(&helper, &[], "pdf", "200", "ok");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let file = PathBuf::from(String::from_utf8(out.stdout).unwrap().trim());
+        assert_eq!(file.extension().unwrap(), "pdf");
+        assert_eq!(std::fs::read(&file).unwrap(), payload);
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let cache = file.parent().unwrap();
+        assert_eq!(
+            std::fs::metadata(cache).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let argv = std::fs::read_to_string(home.0.join("curl-argv")).unwrap();
+        assert!(argv.contains("/clipboard/file?format=pdf>"));
+        assert!(argv.contains("<--max-filesize>\n<67108864>\n"));
+        assert!(argv.contains("<--max-time>\n<180>\n"));
+        assert!(!argv.contains(TOKEN));
+        assert_eq!(
+            std::fs::read_to_string(home.0.join("curl-stdin")).unwrap(),
+            format!("header = \"Authorization: Bearer {TOKEN}\"\n")
+        );
+        for (kind, status, transfer) in [
+            ("pdf", "204", "ok"),
+            ("pdf", "401", "ok"),
+            ("pdf", "200", "fail"),
+            ("fail", "200", "ok"),
+        ] {
+            let out = run(&helper, &[], kind, status, transfer);
+            assert!(!out.status.success());
+            assert!(out.stdout.is_empty());
+            assert_eq!(std::fs::read_dir(cache).unwrap().count(), 1);
+        }
+        for tool in ["xclip", "wl-paste"] {
+            let shim = home.0.join(".local/bin").join(tool);
+            std::fs::write(&shim, helper_script(tool, URL)).unwrap();
+            let native = fake.join(tool);
+            std::fs::write(&native, "#!/bin/bash\nprintf native\n").unwrap();
+            std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let list = if tool == "xclip" {
+                vec!["-selection", "clipboard", "-t", "TARGETS", "-o"]
+            } else {
+                vec!["--list-types"]
+            };
+            let out = run(&shim, &list, "pdf", "200", "ok");
+            assert!(out.status.success());
+            assert_eq!(
+                out.stdout,
+                if tool == "xclip" {
+                    b"TARGETS\napplication/pdf\n".as_slice()
+                } else {
+                    b"application/pdf\n".as_slice()
+                }
+            );
+            for short in [false, true] {
+                for mime in [
+                    "application/pdf",
+                    "image/png",
+                    "image/jpeg",
+                    "text/plain",
+                    "text/markdown",
+                    "text/html",
+                ] {
+                    let args = if tool == "xclip" {
+                        vec![
+                            if short { "-sel" } else { "-selection" },
+                            if short { "clip" } else { "clipboard" },
+                            "-t",
+                            mime,
+                            "-o",
+                        ]
+                    } else {
+                        vec![if short { "-t" } else { "--type" }, mime]
+                    };
+                    let out = run(&shim, &args, "pdf", "200", "ok");
+                    assert_eq!(
+                        out.status.success(),
+                        mime == "application/pdf",
+                        "{tool} {args:?}"
+                    );
+                    assert_eq!(
+                        out.stdout,
+                        if mime == "application/pdf" {
+                            payload.as_slice()
+                        } else {
+                            b""
+                        }
+                    );
+                    if mime == "application/pdf" {
+                        for kind in ["markdown", "image", "empty", "fail", "unknown"] {
+                            let out = run(&shim, &args, kind, "200", "ok");
+                            assert!(!out.status.success(), "{tool}: {kind}");
+                            assert!(out.stdout.is_empty());
+                        }
+                        for (status, transfer) in [("204", "ok"), ("401", "ok"), ("200", "fail")] {
+                            let out = run(&shim, &args, "pdf", status, transfer);
+                            assert!(!out.status.success());
+                            assert!(out.stdout.is_empty());
+                        }
+                    }
+                    assert_eq!(
+                        std::fs::read_dir(cache).unwrap().count(),
+                        1,
+                        "native download leaked"
+                    );
+                }
+            }
+        }
+        assert!(!home.0.join("NEVER_EXECUTE").exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn pdf_download_size_limit_and_cleanup() {
+        let home = TempHome::new();
+        success(home.run(&build_remote_setup_script(URL, TOKEN).unwrap()));
+        let fake = fake_curl(&home);
+        let helper = home.0.join(".local/bin/clipaste-paste");
+        let payload = std::fs::File::create(home.0.join("payload")).unwrap();
+        // Sparse fixtures exercise transfer bounds, not server PDF validation.
+        payload.set_len(67108864).unwrap();
+        let run = |ignore_limit: bool| {
+            home.command()
+                .arg(&helper)
+                .env("PATH", format!("{}:/usr/bin:/bin", fake.display()))
+                .env("FAKE_TYPE", "pdf")
+                .env("FAKE_IGNORE_LIMIT", if ignore_limit { "1" } else { "0" })
+                .output()
+                .unwrap()
+        };
+        let out = run(false);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let file = PathBuf::from(String::from_utf8(out.stdout).unwrap().trim());
+        assert_eq!(std::fs::metadata(&file).unwrap().len(), 67108864);
+        std::fs::remove_file(&file).unwrap();
+        payload.set_len(67108865).unwrap();
+        for ignore_limit in [false, true] {
+            let out = run(ignore_limit);
+            assert!(!out.status.success());
+            assert!(out.stdout.is_empty());
+            assert_eq!(
+                std::fs::read_dir(file.parent().unwrap()).unwrap().count(),
+                0
+            );
+            if ignore_limit {
+                assert!(String::from_utf8_lossy(&out.stderr).contains("download too large"));
+            }
+        }
     }
     #[cfg(unix)]
     #[test]

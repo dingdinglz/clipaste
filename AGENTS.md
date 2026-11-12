@@ -30,12 +30,15 @@ source with `cargo install --path . --locked`.
   explicitly opts into indefinite retention. Cleanup runs at startup and every
   approximately 60 seconds while running; HTTP must reject expired images even
   before cleanup. Do not promise secure erasure or cleanup while stopped.
-- Only `/health` is unauthenticated. Clipboard type, image bytes and Markdown
+- Only `/health` is unauthenticated. Clipboard type, image bytes and Markdown/PDF
   file bytes require the private bearer token. A healthy bridge diagnosis
   includes an authenticated probe. Image/file endpoints must never mix types.
-- Mac file-copy capture supports PNG/TIFF/BMP/JPG/JPEG and UTF-8 `.md` files;
-  Markdown stays a file (4 MiB maximum, no NUL). Never execute or render it.
-  Native Control+V is image-only; Markdown uses the `clipaste-paste` remote path.
+  Helpers pin file formats with `?format=md` or `?format=pdf`; legacy `/clipboard/file`
+  remains Markdown-only to protect old helpers from clipboard-change races.
+- Mac file-copy capture supports PNG/TIFF/BMP/JPG/JPEG, UTF-8 `.md` and `.pdf` files.
+  Markdown stays a file (4 MiB maximum, no NUL); PDF stays binary (64 MiB maximum,
+  header/EOF signature checks only, not sanitization). Never execute or render documents.
+  Native Control+V is image-only; Markdown/PDF use the `clipaste-paste` remote path.
   Do not auto-capture ordinary copied text or claim Windows/Linux file capture.
 - SSH setup transfers the token via stdin and installs helpers which read their
   private token file. WSL first-time setup needs `--token-file PATH` importing a
